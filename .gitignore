@@ -1,0 +1,24 @@
+# ========== 数据文件 ==========
+data/
+*.jsonl
+data/*.json    # 只忽略 data 目录下的 JSON
+*.csv
+*.pkl
+*.npz
+*.h5
+*.npy
+*.pt
+*.bin
+
+# ========== 虚拟环境 ==========
+myenv/
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# 虚拟环境通用文件
+pyvenv.cfg
+pip-selfcheck.json
