@@ -13,6 +13,8 @@ data/*.json    # 只忽略 data 目录下的 JSON
 # =========
 results/
 
+__pycache__/
+*.pyc
 
 # ========== 虚拟环境 ==========
 myenv/
