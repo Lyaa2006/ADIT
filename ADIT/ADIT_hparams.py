@@ -49,9 +49,7 @@ class ADITHyperParams(HyperParams):
     clamp_norm_factor: float = 1.0    # 梯度裁剪范数因子
     L2: float = 1e-4                  # L2正则化
     
-    # ====== 动量调整 ======
-    mom2_adjustment: bool = True          # 是否使用动量调整
-    mom2_update_weight: float = 0.1       # 动量更新权重
+    
     
     # ====== 模块模板 ======
     rewrite_module_tmp: str = "transformer.h.{}.mlp.fc_out"  # 重写模块模板
@@ -61,10 +59,7 @@ class ADITHyperParams(HyperParams):
     ln_f_module: str = "transformer.ln_f"                   # LayerNorm模块
     lm_head_module: str = "lm_head"                         # 输出头模块
     
-    # ====== 统计配置 ======
-    mom2_dataset: str = "wikitext"          # 动量数据集
-    mom2_n_samples: int = 10000             # 动量样本数
-    mom2_dtype: str = "float32"             # 动量数据类型
+   
     
     # ====== 超网络配置 ======
     ctx_dim: int = 4096                     # 上下文维度（匹配模型隐藏层）
@@ -75,8 +70,7 @@ class ADITHyperParams(HyperParams):
     batch_size_edit: int = 4                # 编辑批次大小
     edit_per_forget: int = 3                # 每次遗忘对应的编辑次数
     
-    # ====== 空空间阈值 ======
-    nullspace_threshold: float = 1e-5       # 空空间阈值
+    
     
     def __post_init__(self):
         if self.layers is None:

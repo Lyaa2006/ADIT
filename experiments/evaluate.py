@@ -47,48 +47,67 @@ def evaluate_with_editor(
     max_new_tokens: int = 20
 ) -> Dict:
     """
-    Evaluate using the trained ADIT editor
+    Evaluate using the trained ADIT editor - 返回与compute_rewrite_quality_counterfact相同的格式
     """
-    # CounterFact 数据集的数据结构处理
-    requested_rewrite = record['requested_rewrite']
+    # 获取标准的评估函数
+    from experiments.py.eval_utils_counterfact import compute_rewrite_quality_counterfact
     
-    # 提取 prompt 和 target
-    prompt = requested_rewrite['prompt']
-    subject = requested_rewrite['subject']
-    target_new = requested_rewrite['target_new']['str']
+    # 测试不同的适配器配置
+    eval_results = {}
     
-    # 格式化 prompt
-    full_prompt = prompt.format(subject)
+    # 配置1: 基础模型 (无适配器)
+    with editor._adapters([]):
+        eval_results["base"] = compute_rewrite_quality_counterfact(
+            editor.base_model,
+            tok,
+            record,
+            snips,
+            vec
+        )
     
-    # 创建 BatchItem 用于评估
-    batch_item = type('BatchItem', (), {
-        'prompt': full_prompt,
-        'target_new': target_new,
-        'locality_prompts': [],
-        'neighbor_prompts': []
-    })()
+    # 配置2: 只激活 LF (遗忘适配器)
+    '''with editor._adapters(["LF"]):
+        eval_results["LF_only"] = compute_rewrite_quality_counterfact(
+            editor.base_model,
+            tok,
+            record,
+            snips,
+            vec
+        )'''
     
-    # Test prompts for evaluation
-    test_prompts = [
-        full_prompt,
-        f"What is the capital of {subject}?",
-        f"{subject}'s capital is",
-    ]
+    # 配置3: 只激活 LE (编辑适配器) 
+    with editor._adapters(["LF","LE"]):
+        eval_results["LE_only"] = compute_rewrite_quality_counterfact(
+            editor.base_model,
+            tok,
+            record,
+            snips,
+            vec
+        )
     
-    print(f"\n=== Evaluating Case {record['case_id']} ===")
-    print(f"Edit: {full_prompt} -> {target_new}")
+    # 配置4: 激活 LF+LE (遗忘+编辑)
+    '''with editor._adapters(["LF", "LE"]):
+        eval_results["LF_LE"] = compute_rewrite_quality_counterfact(
+            editor.base_model,
+            tok,
+            record,
+            snips,
+            vec
+        )'''
     
-    # Use editor's preview method for evaluation
-    editor.preview_batch(batch_item, test_prompts, max_new_tokens=max_new_tokens)
+    print(f"[ADIT评估] 不同配置结果:")
+    for config_name, result in eval_results.items():
+        rewrite_correct = result.get('rewrite_prompts_correct', [])
+        rewrite_success = any(rewrite_correct) if rewrite_correct else False
+        print(f"  {config_name}: 重写成功率 {rewrite_success}")
     
-    # 为了兼容性，返回预期的结构
-    # 这里需要根据实际评估结果填充
-    return {
-        'edit_success': True,  # 需要实际的评估逻辑
-        'locality': {},
-        'portability': {},
-        'fluency': {}
-    }
+    # 选择最佳配置（这里选择 LE_only 作为示例）
+    best_config = "LE_only"
+    best_result = eval_results[best_config]
+    
+    # 直接返回与compute_rewrite_quality_counterfact相同的格式
+    # 不要添加额外的嵌套结构
+    return best_result
 
 def main(
     alg_name: str,
@@ -148,7 +167,9 @@ def main(
     else:
         model, tok = model_name
         model_name = model.config._name_or_path
-
+    print(f"Tokenizer class: {type(tok)}")
+    print(f"Model name: {model_name}")
+    print(f"Tokenizer name: {tok.name_or_path}")
     # Load data
     print("Loading dataset, attribute snippets, tf-idf data")
     snips = AttributeSnippets(DATA_DIR) if not skip_generation_tests else None
@@ -211,42 +232,45 @@ def main(
             
             # Use the editor for evaluation
             if editor is not None:
+            # 直接使用评估结果，不要额外嵌套
+                post_result = evaluate_with_editor(
+                editor,
+                tok,
+                record,
+                *(
+                    gen_test_vars
+                    if record["case_id"] % generation_test_interval == 0
+                    else [None, None]
+                ),
+            )
+            
                 metrics = {
-                    "case_id": record["case_id"],
-                    "grouped_case_ids": [r["case_id"] for r in record_chunks],
-                    "num_edits": num_edits,
-                    "requested_rewrite": record["requested_rewrite"],
-                    "time": exec_time,
-                    "post": evaluate_with_editor(
-                        editor,
-                        tok,
-                        record,
-                        *(
-                            gen_test_vars
-                            if record["case_id"] % generation_test_interval == 0
-                            else [None, None]
-                        ),
-                    ),
-                }
+                "case_id": record["case_id"],
+                "grouped_case_ids": [r["case_id"] for r in record_chunks],
+                "num_edits": num_edits,
+                "requested_rewrite": record["requested_rewrite"],
+                "time": exec_time,
+                "post": post_result  # 直接使用，不要额外包装
+            }
             else:
-                # Fallback to original evaluation
+            # Fallback to original evaluation
                 metrics = {
-                    "case_id": record["case_id"],
-                    "grouped_case_ids": [r["case_id"] for r in record_chunks],
-                    "num_edits": num_edits,
-                    "requested_rewrite": record["requested_rewrite"],
-                    "time": exec_time,
-                    "post": ds_eval_method(
-                        edited_model,
-                        tok,
-                        record,
-                        *(
-                            gen_test_vars
-                            if record["case_id"] % generation_test_interval == 0
-                            else [None, None]
-                        ),
+                "case_id": record["case_id"],
+                "grouped_case_ids": [r["case_id"] for r in record_chunks],
+                "num_edits": num_edits,
+                "requested_rewrite": record["requested_rewrite"],
+                "time": exec_time,
+                "post": ds_eval_method(
+                    edited_model,
+                    tok,
+                    record,
+                    *(
+                        gen_test_vars
+                        if record["case_id"] % generation_test_interval == 0
+                        else [None, None]
                     ),
-                }
+                ),
+            }
             
             # Dump metrics in .json
             with open(out_file, "w") as f:

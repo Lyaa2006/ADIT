@@ -21,8 +21,7 @@
     "lambda_spec": 0.08,
     "lambda_orth": 0.003,
     
-    "mom2_adjustment": true,
-    "mom2_update_weight": 15000,
+    
     "L2": 1e-4,
     
     "rewrite_module_tmp": "model.layers.{}.mlp.down_proj",
@@ -32,10 +31,6 @@
     "ln_f_module": "model.norm",
     "lm_head_module": "lm_head",
     
-    "mom2_dataset": "wikipedia",
-    "mom2_n_samples": 100000,
-    "mom2_dtype": "float32",
-    "nullspace_threshold": 2e-2,
     
     "ctx_dim": 4096,
     "hyper_hidden_dim": 256,
