@@ -15,58 +15,48 @@ def compute_z(
     context_templates: List[str],
 ) -> torch.Tensor:
     """
-    ADIT版本：计算目标值向量 - 彻底修复版
+    ADIT版本：计算目标值向量 - 修复维度问题
     """
 
     print("ADIT: Computing target representation")
-    print(f"[DEBUG] Request prompt: {repr(request['prompt'])}")  # 添加调试
-    print(f"[DEBUG] Request subject: {repr(request['subject'])}")  # 添加调试
+    print(f"[DEBUG] Request prompt: {repr(request['prompt'])}")
+    print(f"[DEBUG] Request subject: {repr(request['subject'])}")
 
     # Tokenize target
     target_ids = tok(request["target_new"]["str"], return_tensors="pt")["input_ids"][0]
     if target_ids[0] == tok.bos_token_id or target_ids[0] == tok.unk_token_id:
         target_ids = target_ids[1:]
 
-    # 构建编辑提示 - 彻底修复：分离模板和格式化文本
-    editing_templates = []  # 带{}的模板，用于find_fact_lookup_idx
-    input_texts = []        # 格式化后的文本，用于模型输入
+    # 构建编辑提示
+    editing_templates = []
+    input_texts = []
     
     for context_types in context_templates:
         for context in context_types:
-            # 构建完整的prompt模板（带{}）
-            prompt_template = context.format(request["prompt"])  # 如 "The mother tongue of {} is"
-            full_template = prompt_template + tok.decode(target_ids[:-1])  # 加上目标词
-            editing_templates.append(full_template)  # 保持带{}
+            prompt_template = context.format(request["prompt"])
+            full_template = prompt_template + tok.decode(target_ids[:-1])
+            editing_templates.append(full_template)
             
-            # 构建格式化后的输入文本
-            formatted_text = full_template.format(request["subject"])  # 格式化
+            formatted_text = full_template.format(request["subject"])
             input_texts.append(formatted_text)
-            
-            # 添加调试信息
-            print(f"[DEBUG] Template: {repr(full_template)}")  # 应该带{}
-            print(f"[DEBUG] Formatted: {repr(formatted_text)}")  # 应该格式化
 
     # 为ADIT准备输入
     input_tok = tok(
-        input_texts,  # 使用已经格式化的文本
+        input_texts,
         return_tensors="pt",
         padding=True,
     )
 
-    # 找到关键token位置 - 使用带{}的模板
-    print(f"[DEBUG] Calling find_fact_lookup_idx with templates:")
-    for i, prompt in enumerate(editing_templates):
-        print(f"[DEBUG] Template {i}: {repr(prompt)}")  # 检查传给find_fact_lookup_idx的内容
-    
+    # 找到关键token位置
     lookup_idxs = [
         find_fact_lookup_idx(
-            prompt,  # 这是带{}的模板，如 "The mother tongue of {} is English"
+            prompt,
             request["subject"], 
             tok, 
             hparams.fact_token, 
             verbose=(i == 0)
         )
-        for i, prompt in enumerate(editing_templates)  # 使用editing_templates（带{}）
+        for i, prompt in enumerate(editing_templates)
     ]
 
     # 获取目标层的输出表示
@@ -83,21 +73,25 @@ def compute_z(
         else:
             layer_output = raw_output
 
-    # 提取关键位置的表示作为目标z
+    print(f"[DEBUG] Layer output shape: {layer_output.shape}")
+
+    # 提取关键位置的表示作为目标z - 输出向量（维度应该是6400）
     z_list = []
     for i, idx in enumerate(lookup_idxs):
         if idx < layer_output[i].shape[0]:
-            z_list.append(layer_output[i, idx, :].detach())
+            z_vector = layer_output[i, idx, :].detach()
+            z_list.append(z_vector)
+            print(f"[DEBUG] Sample {i} z vector shape: {z_vector.shape}")
 
     # 平均所有提示的目标表示
     if z_list:
         target_z = torch.stack(z_list).mean(dim=0)
     else:
-        # Fallback: 使用最后一个token的表示
         target_z = layer_output[:, -1, :].mean(dim=0)
 
-    print(f"ADIT: Computed target z vector with norm {target_z.norm()}")
+    print(f"ADIT: Computed target z vector with norm {target_z.norm()}, shape: {target_z.shape}")
     return target_z
+
 
 def get_module_input_output_at_words(
     model: AutoModelForCausalLM,
@@ -151,27 +145,27 @@ def get_module_input_output_at_words(
         # 统一处理输入：可能是元组或单个张量
         if isinstance(input_repr, tuple):
             input_repr = input_repr[0]
-        # 确保是3D张量 [batch, seq_len, hidden]
         if input_repr.dim() == 2:
-            input_repr = input_repr.unsqueeze(0)  # [seq_len, hidden] -> [1, seq_len, hidden]
+            input_repr = input_repr.unsqueeze(0)
             
         # 统一处理输出：可能是元组或单个张量  
         if isinstance(output_repr, tuple):
             output_repr = output_repr[0]
         if output_repr.dim() == 2:
-            output_repr = output_repr.unsqueeze(0)  # [seq_len, hidden] -> [1, seq_len, hidden]
+            output_repr = output_repr.unsqueeze(0)
+
+    print(f"[DEBUG] Input repr shape: {input_repr.shape}")
+    print(f"[DEBUG] Output repr shape: {output_repr.shape}")
 
     # 提取关键位置的输入和输出表示
     input_vectors = []
     output_vectors = []
     
     for i, idx in enumerate(lookup_indices):
-        # 检查索引是否在有效范围内
         if idx < input_repr[i].shape[0]:
             input_vec = input_repr[i, idx, :].detach()
             output_vec = output_repr[i, idx, :].detach()
         else:
-            # 使用最后一个token作为fallback
             input_vec = input_repr[i, -1, :].detach()
             output_vec = output_repr[i, -1, :].detach()
         
@@ -194,7 +188,7 @@ def find_fact_lookup_idx(
     verbose: bool = True,
 ) -> int:
     """
-    ADIT查找关键Token位置 — 使用repr_tools版本
+    ADIT查找关键Token位置 — 改进版：直接匹配subject
     """
     
     if verbose:
@@ -203,44 +197,55 @@ def find_fact_lookup_idx(
         print("  subject:", repr(subject))
         print("  strategy:", fact_token_strategy)
 
-    ret = None
-    
+    # 处理subject_开头的策略
     if fact_token_strategy.startswith("subject_"):
-        # 使用 repr_tools 查找subject位置
         subtoken = fact_token_strategy[len("subject_"):]
-        try:
-            # 调用 repr_tools 的查找函数
-            result = repr_tools.get_words_idxs_in_templates(
-                tok=tok,
-                context_templates=[prompt],
-                words=[subject],
-                subtoken=subtoken,
-            )
-            ret = result[0][0]  # 获取第一个结果
-        except Exception as e:
+        
+        prompt_lower = prompt.lower()
+        subject_lower = subject.lower()
+        
+        if subject_lower in prompt_lower:
+            start_idx = prompt_lower.index(subject_lower)
+            prefix = prompt[:start_idx]
+            
+            prefix_tokens = tok.encode(prefix)
+            subject_tokens = tok.encode(subject)
+            
+            prefix_len = len(prefix_tokens)
+            subject_len = len(subject_tokens)
+            
+            if subtoken == "first":
+                idx = prefix_len
+            elif subtoken == "last":
+                idx = prefix_len + subject_len - 1
+            elif subtoken == "first_after_last":
+                idx = prefix_len + subject_len
+            else:
+                idx = prefix_len + subject_len - 1
+                
             if verbose:
-                print(f"  [WARN] repr_tools查找失败: {e}")
-            # Fallback: 使用最后一个token
-            prompt_enc = tok(prompt, return_tensors="pt", add_special_tokens=False)
-            ret = len(prompt_enc["input_ids"][0]) - 1
+                print(f"  → 找到subject，位置: {idx}")
+            
+            return idx
+        else:
+            if verbose:
+                print(f"  [WARN] Subject '{subject}' not found in prompt, using last token")
+            prompt_tokens = tok.encode(prompt)
+            idx = len(prompt_tokens) - 1
+            return idx
             
     elif fact_token_strategy == "last":
-        # 直接返回最后一个token位置
-        prompt_enc = tok(prompt, return_tensors="pt", add_special_tokens=False)
-        ret = len(prompt_enc["input_ids"][0]) - 1
+        prompt_tokens = tok.encode(prompt)
+        idx = len(prompt_tokens) - 1
+        
+        if verbose:
+            print(f"  → 使用最后一个token，位置: {idx}")
+        
+        return idx
+        
     else:
         if verbose:
-            print(f"  [WARN] 未知策略: {fact_token_strategy}")
-        prompt_enc = tok(prompt, return_tensors="pt", add_special_tokens=False)
-        ret = len(prompt_enc["input_ids"][0]) - 1
-
-    if verbose:
-        print(f"  → 最终选择token位置: {ret}")
-        prompt_enc = tok(prompt, return_tensors="pt", add_special_tokens=False)
-        prompt_tokens = tok.convert_ids_to_tokens(prompt_enc["input_ids"][0])
-        if 0 <= ret < len(prompt_tokens):
-            print(f"  → 对应token: '{prompt_tokens[ret]}'")
-        print("  [END DEBUG]\n")
-
-    return ret
-
+            print(f"  [WARN] Unknown strategy: {fact_token_strategy}, using last token")
+        prompt_tokens = tok.encode(prompt)
+        idx = len(prompt_tokens) - 1
+        return idx

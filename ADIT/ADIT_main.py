@@ -22,16 +22,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from .ADIT_hparams import ADITHyperParams
-from .compute_z import compute_z
-from .compute_ks import compute_ks
-from util.generate import generate_fast
-from .compute_z import find_fact_lookup_idx
 
 # ================================
 # Core Components
 # ================================
-
-CONTEXT_TEMPLATES_CACHE = None
 
 class LoRALinear(nn.Module):
     def __init__(self, module):
@@ -221,9 +215,7 @@ class HyperNetwork(nn.Module):
 
 @dataclass
 class BatchItem:
-    prompt_template: str  # 带{}的原始模板，如 "The mother tongue of {} is"
-    prompt_formatted: str  # 格式化后的prompt，如 "The mother tongue of Danielle Darrieux is"
-    subject: str
+    prompt: str
     target_true: str
     target_new: str
     locality_prompts: List[str]
@@ -251,64 +243,14 @@ class TokenHelper:
             attn = torch.ones_like(ids)
         attn = attn.to(device)
         return ids, attn
-    
 
-def build_target_token_mask(tokenizer, prompt_template: str, prompt_formatted: str, target: str, subject: str, fact_token_strategy: str, device) -> torch.Tensor:
-    """
-    构建目标 token mask - 修复版：
-    - 使用原始模板查找关键位置
-    - 使用格式化后的prompt构建完整输入
-    """
-    # 使用格式化后的prompt构建完整输入文本
-    full_text = prompt_formatted + target
-    full_enc = tokenizer(full_text, return_tensors="pt", add_special_tokens=False)
-    full_ids = full_enc["input_ids"][0]
-
+def build_target_token_mask(tokenizer, prompt: str, target: str, device) -> torch.Tensor:
+    full_ids = tokenizer(prompt + target, return_tensors="pt")["input_ids"][0]
+    prompt_ids = tokenizer(prompt, return_tensors="pt")["input_ids"][0]
     T = full_ids.size(0)
+    P = prompt_ids.size(0)
     mask = torch.zeros(1, T, 1, dtype=torch.float32, device=device)
-
-    # 关键修改：使用原始模板（带{}）来查找关键位置
-    try:
-        key_indices = find_fact_lookup_idx(prompt_template, subject, tokenizer, fact_token_strategy)  # ✅ 使用模板
-    except Exception as e:
-        # 如果查找过程中出错，则 fallback 到 prompt 后部分
-        prompt_ids = tokenizer(prompt_formatted, return_tensors="pt", add_special_tokens=False)["input_ids"][0]
-        P = prompt_ids.size(0)
-        mask[:, P:, :] = 1.0
-        return mask
-
-    # 正常化 key_indices 为列表
-    if key_indices is None:
-        key_indices_list = []
-    elif isinstance(key_indices, int):
-        key_indices_list = [key_indices]
-    else:
-        # 假设是可迭代的索引集合
-        key_indices_list = list(key_indices)
-
-    # 处理并填充 mask
-    filled = False
-    for idx in key_indices_list:
-        # 可能出现负索引（-1 表示最后一个 token）
-        if idx is None:
-            continue
-        if idx < 0:
-            idx = T + idx  # -1 -> T-1
-        if 0 <= idx < T:
-            mask[:, idx, :] = 1.0
-            filled = True
-        else:
-            # 忽略越界索引
-            continue
-
-    if not filled:
-        # 回退到原始逻辑：从 prompt 后开始全部 mask
-        prompt_ids = tokenizer(prompt_formatted, return_tensors="pt", add_special_tokens=False)["input_ids"][0]
-        P = prompt_ids.size(0)
-        # 如果 prompt 长度超出 total length, 保护性处理
-        P = min(P, T)
-        mask[:, P:, :] = 1.0
-
+    mask[:, P:, :] = 1.0
     return mask
 
 def lm_ce_loss(model, ids, attn, labels):
@@ -377,7 +319,6 @@ class ADITEditor:
         
         self.opt_lf = torch.optim.AdamW(lf_params, lr=self.cfg.lr_lf)
         self.opt_le = torch.optim.AdamW(self.hyper.parameters(), lr=cfg.lr_le)
-        self.context_templates = self.get_context_templates()
 
     def _activate(self, adapters, *_, **__):
         for host in self.lora_hosts.values():
@@ -386,112 +327,18 @@ class ADITEditor:
     def _deactivate_all(self, *_, **__):
         for host in self.lora_hosts.values():
             host.disable_all()
-            
-    def compute_layer_contributions(self, batch_items: List[BatchItem]):
-        """使用compute_ks分析各层对编辑的贡献度"""
-        print("Computing layer contributions with compute_ks...")
-    
-    # 创建requests格式 - 关键修改：使用带{}的模板
-        requests = []
-        for bi in batch_items:
-        # 这里需要原始带{}的模板，但我们现在只有格式化后的
-        # 临时解决方案：使用默认模板
-            requests.append({
-            "prompt": bi.prompt_template,  # 使用默认模板
-            "subject": bi.subject,
-            "target_new": {"str": bi.target_new}
-        })
-    
-        layer_contributions = {}
-        for layer_name in self.lora_hosts.keys():
-        # 提取层ID
-            import re
-            m = re.search(r"\.h\.(\d+)\.", layer_name)
-            if not m:
-                raise ValueError(f"[ADIT] Cannot parse layer id from layer_name: {layer_name}")
-            layer_id = int(m.group(1))
-        
-        # 计算该层的键向量
-            try:
-                keys = compute_ks(
-                self.base_model,
-                self.tokenizer,
-                requests,
-                self.cfg,
-                layer_id,
-                self.context_templates,
-            )
-                contribution = keys.norm(dim=1).mean().item()
-                layer_contributions[layer_name] = contribution
-                print(f"Layer {layer_name} contribution: {contribution:.4f}")
-            except Exception as e:
-                print(f"Error computing keys for layer {layer_name}: {e}")
-                layer_contributions[layer_name] = 1.0
-    
-        return layer_contributions
-    
-    def get_context_templates(self):
-        """获取上下文模板，用于compute_z和compute_ks"""
-        global CONTEXT_TEMPLATES_CACHE
-        
-        if CONTEXT_TEMPLATES_CACHE is None:
-            CONTEXT_TEMPLATES_CACHE = [["{}"]] + [
-                [
-                    f.replace("{", " ").replace("}", " ") + ". {}"
-                    for f in generate_fast(
-                        self.base_model,
-                        self.tokenizer,
-                        ["The", "Therefore", "Because", "I", "You"],
-                        n_gen_per_prompt=5,
-                        max_out_len=10,
-                    )
-                ]
-            ]
-        return CONTEXT_TEMPLATES_CACHE
 
     def build_context(self, batch: BatchItem) -> torch.Tensor:
-     """构建上下文，使用原始模板"""
-    
-    # 使用更详细的缓存键，包含所有相关信息
-     cache_key = f"{batch.prompt_template}_{batch.subject}_{batch.target_new}_{id(batch)}"
-    
-     if not hasattr(self, '_context_cache'):
-        self._context_cache = {}
-    
-     if cache_key in self._context_cache:
-        print(f"[ADIT] 使用缓存的上下文向量")  # 添加调试
-        return self._context_cache[cache_key]
-    
-    # 使用原始模板（带{}）
-     temp_request = {
-        "prompt": batch.prompt_template,  # 使用原始模板
-        "subject": batch.subject,
-        "target_new": {"str": batch.target_new}
-    }
-    
-     print(f"[ADIT] 计算新的上下文向量，使用模板: {repr(batch.prompt_template)}")  # 调试
-    
-     with torch.no_grad():
-        z_layer = len(self.lora_hosts) // 2
-        target_z = compute_z(
-            self.base_model,
-            self.tokenizer,
-            temp_request,
-            self.cfg,
-            z_layer,
-            self.context_templates,
-        )
-        
-        ctx = target_z.unsqueeze(0)
-        self._context_cache[cache_key] = ctx
-        
-        # 限制缓存大小，避免内存泄漏
-        if len(self._context_cache) > 10:  # 减少缓存大小
-            oldest_key = next(iter(self._context_cache))
-            del self._context_cache[oldest_key]
-            print(f"[ADIT] 清理缓存，当前大小: {len(self._context_cache)}")
-    
-     return ctx
+        with torch.no_grad():
+            ids, _ = self.tok.encode(batch.prompt + batch.target_new, self.cfg.device)
+            if hasattr(self.base_model, "transformer") and hasattr(self.base_model.transformer, "wte"):
+                emb = self.base_model.transformer.wte(ids)
+            elif hasattr(self.base_model, "model") and hasattr(self.base_model.model, "embed_tokens"):
+                emb = self.base_model.model.embed_tokens(ids)
+            else:
+                emb = torch.randn(1, ids.size(1), self.cfg.ctx_dim, device=self.cfg.device)
+            ctx = emb.mean(dim=1)
+        return ctx
 
     def step_forget_batch(self, items: list, clip_norm: float = 1.0):
         self.opt_lf.zero_grad(set_to_none=True)
@@ -501,7 +348,7 @@ class ADITEditor:
         for bi in items:
             self._deactivate_all()
             self._activate(["LF"])
-            ids, attn, labels = self.tok.encode_label_for_target(bi.prompt_formatted, bi.target_true, self.cfg.device)
+            ids, attn, labels = self.tok.encode_label_for_target(bi.prompt, bi.target_true, self.cfg.device)
             ce_true = lm_ce_loss(self.base_model, ids, attn, labels)
 
             kl_loc = torch.tensor(0.0, device=self.cfg.device)
@@ -539,41 +386,19 @@ class ADITEditor:
         }
 
     def step_edit_batch(self, items: list, clip_norm: float = 1.0):
-        """
-    增强版的编辑步骤，使用compute_z和compute_ks
-    """
         self.opt_le.zero_grad(set_to_none=True)
         total_loss = 0.0
         log_ce = 0.0
 
-    # 只在第一次或必要时计算层贡献
-        if not hasattr(self, '_cached_layer_contributions'):
-            print("[ADIT] 首次计算层贡献度...")
-            self._cached_layer_contributions = self.compute_layer_contributions(items)
-    
-        layer_contributions = self._cached_layer_contributions
-        print(f"[ADIT] 使用缓存的层贡献度，共 {len(layer_contributions)} 层")
-    
         for bi in items:
-        # 使用compute_z构建更精确的上下文
             ctx = self.build_context(bi)
-        
-        # 根据层贡献度调整超网络输出
             le_weights = self.hyper(ctx)
             for name, host in self.lora_hosts.items():
                 A, B = le_weights[name]
-            
-            # 根据层贡献度调整权重
-                contribution = layer_contributions.get(name, 1.0)
-                A = A * contribution
-                B = B * contribution
-            
                 host.bind_runtime("LE", A, B)
 
-        # 原有训练逻辑保持不变
-            ids, attn, labels = self.tok.encode_label_for_target(bi.prompt_formatted, bi.target_new, self.cfg.device)
-            tok_mask = build_target_token_mask(self.tokenizer, bi.prompt_template,bi.prompt_formatted, bi.target_new, bi.subject, self.cfg.fact_token, self.cfg.device)
-        
+            ids, attn, labels = self.tok.encode_label_for_target(bi.prompt, bi.target_new, self.cfg.device)
+            tok_mask = build_target_token_mask(self.tokenizer, bi.prompt, bi.target_new, self.cfg.device)
             for host in self.lora_hosts.values():
                 host.bind_token_mask("LE", tok_mask)
 
@@ -584,7 +409,6 @@ class ADITEditor:
             total_loss = total_loss + ce_new
             log_ce += float(ce_new.detach().cpu())
 
-        # 清理
             for host in self.lora_hosts.values():
                 host.clear_runtime()
                 host.clear_token_masks()
@@ -720,36 +544,30 @@ def apply_ADIT_to_model(
         # 直接在这里转换 requests，避免重复函数
         batch_items = []
         for request in requests:
-    # 保存原始模板
-            prompt_template = request['prompt']  # 原始模板，带{}
-    
-    # 格式化prompt用于训练
-            prompt_formatted = request['prompt']
+            prompt = request['prompt']
             if 'subject' in request:
-                prompt_formatted = prompt_formatted.format(request['subject'])
-    
+                prompt = prompt.format(request['subject'])
+            
             target_true = request.get('target_true', '')
             if isinstance(target_true, dict):
                 target_true = target_true.get('str', '')
-        
+                
             target_new = request['target_new']
             if isinstance(target_new, dict):
                 target_new = target_new.get('str', '')
-    
+            
             def _norm_target(s: str):
                 s = s or ""
                 s = s.rstrip("\n")
                 return s if s.startswith(" ") else " " + s
-    
+            
             batch_items.append(BatchItem(
-        prompt_template=prompt_template,      # 原始模板（带{}）
-        prompt_formatted=prompt_formatted,    # 格式化后的
-        subject=request.get('subject',''),
-        target_true=_norm_target(target_true),
-        target_new=_norm_target(target_new),
-        locality_prompts=request.get('locality_prompts', []) or [],
-        neighbor_prompts=request.get('neighbor_prompts', []) or [],
-    ))
+                prompt=prompt,
+                target_true=_norm_target(target_true),
+                target_new=_norm_target(target_new),
+                locality_prompts=request.get('locality_prompts', []) or [],
+                neighbor_prompts=request.get('neighbor_prompts', []) or [],
+            ))
         
         # 在新数据上继续训练
         editor.train_multiedit(
@@ -765,36 +583,30 @@ def apply_ADIT_to_model(
     # 第一次运行：初始化编辑器（这里也使用相同的转换逻辑）
     batch_items = []
     for request in requests:
-    # 保存原始模板
-        prompt_template = request['prompt']  # 原始模板，带{}
-    
-    # 格式化prompt用于训练
-        prompt_formatted = request['prompt']
+        prompt = request['prompt']
         if 'subject' in request:
-            prompt_formatted = prompt_formatted.format(request['subject'])
-    
+            prompt = prompt.format(request['subject'])
+        
         target_true = request.get('target_true', '')
         if isinstance(target_true, dict):
             target_true = target_true.get('str', '')
-        
+            
         target_new = request['target_new']
         if isinstance(target_new, dict):
             target_new = target_new.get('str', '')
-    
+        
         def _norm_target(s: str):
-                s = s or ""
-                s = s.rstrip("\n")
-                return s if s.startswith(" ") else " " + s
-    
+            s = s or ""
+            s = s.rstrip("\n")
+            return s if s.startswith(" ") else " " + s
+        
         batch_items.append(BatchItem(
-        prompt_template=prompt_template,      # 原始模板（带{}）
-        prompt_formatted=prompt_formatted,    # 格式化后的
-        subject=request.get('subject',''),
-        target_true=_norm_target(target_true),
-        target_new=_norm_target(target_new),
-        locality_prompts=request.get('locality_prompts', []) or [],
-        neighbor_prompts=request.get('neighbor_prompts', []) or [],
-    ))
+            prompt=prompt,
+            target_true=_norm_target(target_true),
+            target_new=_norm_target(target_new),
+            locality_prompts=request.get('locality_prompts', []) or [],
+            neighbor_prompts=request.get('neighbor_prompts', []) or [],
+        ))
 
     # Build target layers
     target_layer_names = []

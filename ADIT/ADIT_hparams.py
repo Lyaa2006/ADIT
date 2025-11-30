@@ -24,7 +24,7 @@ class ADITHyperParams(HyperParams):
     # ====== LoRA 配置 ======
     lf_rank: int = 8           # 遗忘LoRA的秩
     le_rank: int = 16          # 编辑LoRA的秩  
-    alpha: float = 16.0        # LoRA缩放系数
+    alpha: float = 16        # LoRA缩放系数
     
     # ====== 训练参数 ======
     # 遗忘步参数
@@ -32,6 +32,11 @@ class ADITHyperParams(HyperParams):
     v_lr: float = 5e-4            # 遗忘学习率
     v_loss_layer: int = -1        # 损失层
     v_weight_decay: float = 1e-4  # 权重衰减
+    
+    use_alphaedit_localization : bool=False
+    alphaedit_lambda:float=0.1
+    layers:List[int]=None
+    subject_patterns:List[str]=None
     
     lr_lf: float = 5e-4   
     # 编辑步参数  

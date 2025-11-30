@@ -32,7 +32,7 @@ def get_reprs_at_word_tokens(
     return get_reprs_at_idxs(
         model,
         tok,
-        [context_templates[i].format(words[i]) for i in range(len(words))],
+        [context_templates[i] for i in range(len(words))],  # 直接使用原上下文，不格式化
         idxs,
         layer,
         module_template,
@@ -40,83 +40,61 @@ def get_reprs_at_word_tokens(
     )
 
 def get_words_idxs_in_templates(
-    tok: AutoTokenizer, context_templates: str, words: str, subtoken: str
-) -> int:
+    tok: AutoTokenizer, context_templates: List[str], words: List[str], subtoken: str
+) -> List[List[int]]:
     """
-    Given list of template strings, each with *one* format specifier
-    (e.g. "{} plays basketball"), and words to be substituted into the
-    template, computes the post-tokenization index of their last tokens.
+    ADIT改进版：直接在上下文中查找词语位置，支持大小写不敏感匹配
     """
 
-    assert all(
-        tmp.count("{}") == 1 for tmp in context_templates
-    ), "We currently do not support multiple fill-ins for context"
-
-
-    prefixes_len, words_len, suffixes_len, inputs_len = [], [], [], []
+    idxs = []
+    
     for i, context in enumerate(context_templates):
-        prefix, suffix = context.split("{}")
-        prefix_len = len(tok.encode(prefix))
-        prompt_len = len(tok.encode(prefix + words[i]))
-        input_len = len(tok.encode(prefix + words[i] + suffix))
-        prefixes_len.append(prefix_len)
-        words_len.append(prompt_len - prefix_len)
-        suffixes_len.append(input_len - prompt_len)
-        inputs_len.append(input_len)
-
-    # Compute prefixes and suffixes of the tokenized context
-    # fill_idxs = [tmp.index("{}") for tmp in context_templates]
-    # prefixes, suffixes = [
-    #     tmp[: fill_idxs[i]] for i, tmp in enumerate(context_templates)
-    # ], [tmp[fill_idxs[i] + 2 :] for i, tmp in enumerate(context_templates)]
-    # words = deepcopy(words)
-    #
-    # # Pre-process tokens
-    # for i, prefix in enumerate(prefixes):
-    #     if len(prefix) > 0:
-    #         assert prefix[-1] == " "
-    #         prefix = prefix[:-1]
-    #
-    #         prefixes[i] = prefix
-    #         words[i] = f" {words[i].strip()}"
-    #
-    # # Tokenize to determine lengths
-    # assert len(prefixes) == len(words) == len(suffixes)
-    # n = len(prefixes)
-    # batch_tok = tok([*prefixes, *words, *suffixes])
-    # if 'input_ids' in batch_tok:
-    #     batch_tok = batch_tok['input_ids']
-    # prefixes_tok, words_tok, suffixes_tok = [
-    #     batch_tok[i : i + n] for i in range(0, n * 3, n)
-    # ]
-    # prefixes_len, words_len, suffixes_len = [
-    #     [len(el) for el in tok_list]
-    #     for tok_list in [prefixes_tok, words_tok, suffixes_tok]
-    # ]
-
-    # Compute indices of last tokens
-    if subtoken == "last" or subtoken == "first_after_last":
-        return [
-            [
-                prefixes_len[i]
-                + words_len[i]
-                - (1 if subtoken == "last" or suffixes_len[i] == 0 else 0)
-            ]
-            # If suffix is empty, there is no "first token after the last".
-            # So, just return the last token of the word.
-            for i in range(len(context_templates))
-        ]
-    elif subtoken == "first":
-        return [[prefixes_len[i] - inputs_len[i]] for i in range(len(context_templates))]
-    else:
-        raise ValueError(f"Unknown subtoken type: {subtoken}")
+        word = words[i]
+        
+        # 大小写不敏感匹配
+        context_lower = context.lower()
+        word_lower = word.lower()
+        
+        if word_lower in context_lower:
+            # 找到word的起始位置
+            start_idx = context_lower.index(word_lower)
+            # 编码context到该位置的部分
+            prefix = context[:start_idx]
+            prefix_tokens = tok.encode(prefix)
+            prefix_len = len(prefix_tokens)
+            
+            # 编码整个word来获取长度
+            word_tokens = tok.encode(word)
+            word_len = len(word_tokens)
+            
+            # 根据subtoken策略返回位置
+            if subtoken == "last":
+                # subject的最后一个token
+                idx = prefix_len + word_len - 1
+            elif subtoken == "first":
+                # subject的第一个token  
+                idx = prefix_len
+            elif subtoken == "first_after_last":
+                # subject后面的第一个token
+                idx = prefix_len + word_len
+            else:
+                # 默认使用最后一个token
+                idx = prefix_len + word_len - 1
+                
+            idxs.append([idx])
+        else:
+            # fallback: 使用最后一个token
+            context_tokens = tok.encode(context)
+            idxs.append([len(context_tokens) - 1])
+    
+    return idxs
 
 
 def get_reprs_at_idxs(
     model: AutoModelForCausalLM,
     tok: AutoTokenizer,
-    contexts: List[str],#表示该知识的完整句子
-    idxs: List[List[int]],#被填入词的位置
+    contexts: List[str],
+    idxs: List[List[int]],
     layer: int,
     module_template: str,
     track: str = "in",
@@ -128,14 +106,14 @@ def get_reprs_at_idxs(
 
     def _batch(n):
         for i in range(0, len(contexts), n):
-            yield contexts[i : i + n], idxs[i : i + n]#将句子和被填词位置分块
+            yield contexts[i : i + n], idxs[i : i + n]
 
     assert track in {"in", "out", "both"}
     both = track == "both"
     tin, tout = (
         (track == "in" or both),
         (track == "out" or both),
-    )#tin tout都是bool结构
+    )
     module_name = module_template.format(layer)
     to_return = {"in": [], "out": []}
 
@@ -148,7 +126,6 @@ def get_reprs_at_idxs(
             to_return[key].append(cur_repr[i][idx_list].mean(0))
 
     for batch_contexts, batch_idxs in _batch(n=128):
-        #contexts_tok:[21 19]
         contexts_tok = tok(batch_contexts, padding=True, return_tensors="pt").to(
             next(model.parameters()).device
         )

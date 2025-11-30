@@ -10,7 +10,7 @@ import json
 import shutil
 from itertools import islice
 from time import time
-from typing import Tuple, Union,Dict
+from typing import Tuple, Union, Dict
 import numpy as np
 import torch
 import sys
@@ -27,7 +27,7 @@ from dsets import (
 from experiments.py.eval_utils_counterfact import compute_rewrite_quality_counterfact
 from util import nethook
 from util.globals import *
-from ADIT.ADIT_main import apply_ADIT_to_model, ADITEditor, ADITConfig
+from ADIT.ADIT_main import apply_ADIT_to_model, ADITEditor, ADITConfig, BatchItem
 from ADIT.ADIT_hparams import ADITHyperParams
 
 ALG_DICT = {
@@ -37,77 +37,6 @@ ALG_DICT = {
 DS_DICT = {
     "cf": (CounterFactDataset, compute_rewrite_quality_counterfact),
 }
-
-def evaluate_with_editor(
-    editor: ADITEditor,
-    tok: AutoTokenizer,
-    record: Dict,
-    snips: AttributeSnippets = None,
-    vec = None,
-    max_new_tokens: int = 20
-) -> Dict:
-    """
-    Evaluate using the trained ADIT editor - 返回与compute_rewrite_quality_counterfact相同的格式
-    """
-    # 获取标准的评估函数
-    from experiments.py.eval_utils_counterfact import compute_rewrite_quality_counterfact
-    
-    # 测试不同的适配器配置
-    eval_results = {}
-    
-    # 配置1: 基础模型 (无适配器)
-    with editor._adapters([]):
-        eval_results["base"] = compute_rewrite_quality_counterfact(
-            editor.base_model,
-            tok,
-            record,
-            snips,
-            vec
-        )
-    
-    # 配置2: 只激活 LF (遗忘适配器)
-    '''with editor._adapters(["LF"]):
-        eval_results["LF_only"] = compute_rewrite_quality_counterfact(
-            editor.base_model,
-            tok,
-            record,
-            snips,
-            vec
-        )'''
-    
-    # 配置3: 只激活 LE (编辑适配器) 
-    with editor._adapters(["LF","LE"]):
-        eval_results["LE_only"] = compute_rewrite_quality_counterfact(
-            editor.base_model,
-            tok,
-            record,
-            snips,
-            vec
-        )
-    
-    # 配置4: 激活 LF+LE (遗忘+编辑)
-    '''with editor._adapters(["LF", "LE"]):
-        eval_results["LF_LE"] = compute_rewrite_quality_counterfact(
-            editor.base_model,
-            tok,
-            record,
-            snips,
-            vec
-        )'''
-    
-    print(f"[ADIT评估] 不同配置结果:")
-    for config_name, result in eval_results.items():
-        rewrite_correct = result.get('rewrite_prompts_correct', [])
-        rewrite_success = any(rewrite_correct) if rewrite_correct else False
-        print(f"  {config_name}: 重写成功率 {rewrite_success}")
-    
-    # 选择最佳配置（这里选择 LE_only 作为示例）
-    best_config = "LE_only"
-    best_result = eval_results[best_config]
-    
-    # 直接返回与compute_rewrite_quality_counterfact相同的格式
-    # 不要添加额外的嵌套结构
-    return best_result
 
 def main(
     alg_name: str,
@@ -167,9 +96,7 @@ def main(
     else:
         model, tok = model_name
         model_name = model.config._name_or_path
-    print(f"Tokenizer class: {type(tok)}")
-    print(f"Model name: {model_name}")
-    print(f"Tokenizer name: {tok.name_or_path}")
+
     # Load data
     print("Loading dataset, attribute snippets, tf-idf data")
     snips = AttributeSnippets(DATA_DIR) if not skip_generation_tests else None
@@ -232,45 +159,80 @@ def main(
             
             # Use the editor for evaluation
             if editor is not None:
-            # 直接使用评估结果，不要额外嵌套
-                post_result = evaluate_with_editor(
-                editor,
-                tok,
-                record,
-                *(
-                    gen_test_vars
-                    if record["case_id"] % generation_test_interval == 0
-                    else [None, None]
-                ),
-            )
-            
+                # 创建BatchItem用于构建上下文
+                requested_rewrite = record["requested_rewrite"]
+                prompt = requested_rewrite["prompt"]
+                subject = requested_rewrite["subject"]
+                target_new = requested_rewrite["target_new"]["str"]
+                
+                # 格式化prompt
+                full_prompt = prompt.format(subject)
+                
+                # 创建BatchItem
+                batch_item = BatchItem(
+                    prompt=full_prompt,
+                    target_true="",  # 评估时不需要target_true
+                    target_new=target_new,
+                    locality_prompts=[],
+                    neighbor_prompts=[]
+                )
+                
+                # 准备LE权重用于评估
+                ctx = editor.build_context(batch_item)
+                le_weights = editor.hyper(ctx)
+                
+                # 绑定LE权重到所有LoRA主机
+                for name, host in editor.lora_hosts.items():
+                    A, B = le_weights[name]
+                    host.set_adapter_weights("LE", A, B)
+                
+                # 只激活LE适配器进行评估
+                editor._deactivate_all()
+                editor._activate(["LE"])
+                
+                try:
+                    # 使用绑定LE权重的模型进行评估
+                    post_results = ds_eval_method(
+                        editor.base_model,  # 使用基础模型，但已绑定LE权重
+                        tok,
+                        record,
+                        *(
+                            gen_test_vars
+                            if record["case_id"] % generation_test_interval == 0
+                            else [None, None]
+                        ),
+                    )
+                finally:
+                    # 清理：停用所有适配器
+                    editor._deactivate_all()
+                
                 metrics = {
-                "case_id": record["case_id"],
-                "grouped_case_ids": [r["case_id"] for r in record_chunks],
-                "num_edits": num_edits,
-                "requested_rewrite": record["requested_rewrite"],
-                "time": exec_time,
-                "post": post_result  # 直接使用，不要额外包装
-            }
+                    "case_id": record["case_id"],
+                    "grouped_case_ids": [r["case_id"] for r in record_chunks],
+                    "num_edits": num_edits,
+                    "requested_rewrite": record["requested_rewrite"],
+                    "time": exec_time,
+                    "post": post_results,
+                }
             else:
-            # Fallback to original evaluation
+                # Fallback to original evaluation
                 metrics = {
-                "case_id": record["case_id"],
-                "grouped_case_ids": [r["case_id"] for r in record_chunks],
-                "num_edits": num_edits,
-                "requested_rewrite": record["requested_rewrite"],
-                "time": exec_time,
-                "post": ds_eval_method(
-                    edited_model,
-                    tok,
-                    record,
-                    *(
-                        gen_test_vars
-                        if record["case_id"] % generation_test_interval == 0
-                        else [None, None]
+                    "case_id": record["case_id"],
+                    "grouped_case_ids": [r["case_id"] for r in record_chunks],
+                    "num_edits": num_edits,
+                    "requested_rewrite": record["requested_rewrite"],
+                    "time": exec_time,
+                    "post": ds_eval_method(
+                        edited_model,
+                        tok,
+                        record,
+                        *(
+                            gen_test_vars
+                            if record["case_id"] % generation_test_interval == 0
+                            else [None, None]
+                        ),
                     ),
-                ),
-            }
+                }
             
             # Dump metrics in .json
             with open(out_file, "w") as f:
