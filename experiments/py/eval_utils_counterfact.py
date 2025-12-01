@@ -48,7 +48,9 @@ def compute_rewrite_quality_counterfact(
     paraphrase_prompts = record["paraphrase_prompts"]
     neighborhood_prompts = record["neighborhood_prompts"]
     generation_prompts = record["generation_prompts"]
-
+    print(paraphrase_prompts)
+    print(neighborhood_prompts)
+    print(generation_prompts)
     # Form a list of lists of prefixes to test.
     prob_prompts = [
         rewrite_prompts,

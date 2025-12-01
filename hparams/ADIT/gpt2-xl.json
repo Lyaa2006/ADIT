@@ -2,7 +2,7 @@
     "model_name": "gpt2-xl",
     "layers": [13, 14, 15, 16, 17],
     "layer_selection": "specified",
-    "fact_token": "subject_last",
+    "fact_token": "subject_first_after_last",
     
     "lf_rank": 4,
     "le_rank": 8,

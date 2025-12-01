@@ -19,7 +19,7 @@ class ADITHyperParams(HyperParams):
     # 事实token定位策略
     fact_token: Literal[
         "last", "subject_first", "subject_last", "subject_first_after_last"
-    ] = "last"
+    ] = "subject_first"
     
     # ====== LoRA 配置 ======
     lf_rank: int = 8           # 遗忘LoRA的秩
@@ -53,11 +53,13 @@ class ADITHyperParams(HyperParams):
     # ====== 训练约束 ======
     clamp_norm_factor: float = 1.0    # 梯度裁剪范数因子
     L2: float = 1e-4                  # L2正则化
-    
+    use_vector_guidance:bool =True
+    vector_guidance_weight: float=0.3
+    vector_alignment_weight: float=0.1
     
     
     # ====== 模块模板 ======
-    rewrite_module_tmp: str = "transformer.h.{}.mlp.fc_out"  # 重写模块模板
+    rewrite_module_tmp: str = "transformer.h.{}.mlp.f_proj"  # 重写模块模板
     layer_module_tmp: str = "transformer.h.{}"              # 层模块模板
     mlp_module_tmp: str = "transformer.h.{}.mlp"            # MLP模块模板
     attn_module_tmp: str = "transformer.h.{}.attn"          # 注意力模块模板
@@ -67,7 +69,7 @@ class ADITHyperParams(HyperParams):
    
     
     # ====== 超网络配置 ======
-    ctx_dim: int = 4096                     # 上下文维度（匹配模型隐藏层）
+    ctx_dim: int = 1600                     # 上下文维度（匹配模型隐藏层）
     hyper_hidden_dim: int = 256             # 超网络隐藏层维度
     
     # ====== 批次训练 ======

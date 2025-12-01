@@ -33,11 +33,11 @@ def compute_z(
     
     for context_types in context_templates:
         for context in context_types:
-            prompt_template = context.format(request["prompt"])
-            full_template = prompt_template + tok.decode(target_ids[:-1])
+            formatted_template = context.format(request["subject"])
+            full_template = formatted_template + tok.decode(target_ids[:-1])
             editing_templates.append(full_template)
-            
-            formatted_text = full_template.format(request["subject"])
+        
+            formatted_text = full_template  # 已经格式化，不需要再次格式化
             input_texts.append(formatted_text)
 
     # 为ADIT准备输入
@@ -188,64 +188,70 @@ def find_fact_lookup_idx(
     verbose: bool = True,
 ) -> int:
     """
-    ADIT查找关键Token位置 — 改进版：直接匹配subject
+    ADIT查找关键Token位置 — 改进版，解决tokenization上下文依赖问题
     """
     
     if verbose:
         print("\n[DEBUG] find_fact_lookup_idx")
-        print("  prompt:", repr(prompt))
-        print("  subject:", repr(subject))
-        print("  strategy:", fact_token_strategy)
+        print("raw: ",prompt)
+        print(f"  prompt: {repr(prompt)}")
+        print(f"  subject: {repr(subject)}")
+        print(f"  strategy: {fact_token_strategy}")
 
-    # 处理subject_开头的策略
-    if fact_token_strategy.startswith("subject_"):
+    # 直接使用我们改进的repr_tools函数
+    if fact_token_strategy == "last":
+        # 最后一个token策略
+        result = repr_tools.get_words_idxs_in_templates(
+            tok=tok,
+            context_templates=[prompt],
+            words=[""],  # 空字符串会触发默认的最后一个token逻辑
+            subtoken="last",  # 明确指定策略
+        )[0][0]
+        
+    elif fact_token_strategy.startswith("subject_"):
+        # subject相关策略
         subtoken = fact_token_strategy[len("subject_"):]
         
-        prompt_lower = prompt.lower()
-        subject_lower = subject.lower()
-        
-        if subject_lower in prompt_lower:
-            start_idx = prompt_lower.index(subject_lower)
-            prefix = prompt[:start_idx]
-            
-            prefix_tokens = tok.encode(prefix)
-            subject_tokens = tok.encode(subject)
-            
-            prefix_len = len(prefix_tokens)
-            subject_len = len(subject_tokens)
-            
-            if subtoken == "first":
-                idx = prefix_len
-            elif subtoken == "last":
-                idx = prefix_len + subject_len - 1
-            elif subtoken == "first_after_last":
-                idx = prefix_len + subject_len
-            else:
-                idx = prefix_len + subject_len - 1
-                
-            if verbose:
-                print(f"  → 找到subject，位置: {idx}")
-            
-            return idx
-        else:
-            if verbose:
-                print(f"  [WARN] Subject '{subject}' not found in prompt, using last token")
-            prompt_tokens = tok.encode(prompt)
-            idx = len(prompt_tokens) - 1
-            return idx
-            
-    elif fact_token_strategy == "last":
-        prompt_tokens = tok.encode(prompt)
-        idx = len(prompt_tokens) - 1
-        
-        if verbose:
-            print(f"  → 使用最后一个token，位置: {idx}")
-        
-        return idx
+        result = repr_tools.get_words_idxs_in_templates(
+            tok=tok,
+            context_templates=[prompt],
+            words=[subject],
+            subtoken=subtoken,
+        )[0][0]
         
     else:
-        if verbose:
-            print(f"  [WARN] Unknown strategy: {fact_token_strategy}, using last token")
-        prompt_tokens = tok.encode(prompt)
-        idx = len(prompt_tokens) - 1
-        return idx
+        raise ValueError(f"fact_token={fact_token_strategy} not recognized")
+
+    # 验证和输出结果
+    if verbose:
+        # 构建完整文本用于验证
+        if "{}" in prompt:
+            full_text = prompt.format(subject)
+        else:
+            full_text = prompt + " " + subject if subject else prompt
+        
+        try:
+            # 获取tokenization结果
+            encoding = tok(
+                full_text,
+                return_offsets_mapping=True,
+                add_special_tokens=False
+            )
+            tokens = encoding["input_ids"]
+            
+            if 0 <= result < len(tokens):
+                token_at_pos = tok.decode([tokens[result]])
+                print(f"  → 最终位置: {result}, 对应token: '{token_at_pos}'")
+            else:
+                print(f"  → 最终位置: {result} (超出范围, tokens长度: {len(tokens)})")
+                
+        except:
+            # 如果offset_mapping失败，使用简单方法
+            tokens = tok.encode(full_text, add_special_tokens=False)
+            if 0 <= result < len(tokens):
+                token_at_pos = tok.decode([tokens[result]])
+                print(f"  → 最终位置: {result}, 对应token: '{token_at_pos}'")
+            else:
+                print(f"  → 最终位置: {result} (超出范围)")
+    
+    return result
