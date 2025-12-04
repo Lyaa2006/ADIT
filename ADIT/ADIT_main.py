@@ -1,4 +1,3 @@
-
 """
 ADIT with Vector Guidance: 使用compute_z和compute_z计算精准向量来指导LoRA生成
 """
@@ -42,6 +41,7 @@ class BatchItem:
     target_new: str
     locality_prompts: List[str]
     neighbor_prompts: List[str]
+    paraphrase_prompts:List[str]
 
 @dataclass 
 class ADITConfig:
@@ -55,6 +55,7 @@ class ADITConfig:
     lambda_kl: float = 1.0
     lambda_spec: float = 0.5
     lambda_orth: float = 0.05
+    lambda_neighbor: float=0.2
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     # Training parameters
     v_num_grad_steps: int = 20
@@ -78,88 +79,162 @@ class ADITConfig:
 # Core Components (保持不变)
 # ================================
 
-class LoRALinear(nn.Module):
-    def __init__(self, module):
+# 在文件顶部，删除LoRALinear类，替换为：
+
+# ---------- REPLACE Conv1DLoRA.__init__ AND Conv1DLoRA.forward START ----------
+class Conv1DLoRA(nn.Module):
+    """
+    专门适配GPT-2 Conv1D层的LoRA实现，简洁版、去掉大量调试输出
+    """
+    def __init__(self, conv1d_module):
         super().__init__()
-        
-        if hasattr(module, 'weight') and len(module.weight.shape) == 2:
-            self.in_features = module.weight.shape[0]
-            self.out_features = module.weight.shape[1]
-            self.is_conv1d = True
-        else:
-            raise ValueError(f"Unsupported module type: {type(module)}")
-        
-        self.original_module = module
-        self.bias = hasattr(module, 'bias') and module.bias is not None
+
+        if not (hasattr(conv1d_module, 'weight') and len(conv1d_module.weight.shape) == 2):
+            raise ValueError(f"Module must be Conv1D-like with 2D weight, got {type(conv1d_module)}")
+
+        # 保存原始Conv1D模块的引用
+        self.original_module = conv1d_module
+
+        # 获取维度信息
+        self.in_features = conv1d_module.weight.shape[0]
+        self.out_features = conv1d_module.weight.shape[1]
+
+        # 检查是否有偏置
+        self.has_bias = hasattr(conv1d_module, 'bias') and conv1d_module.bias is not None
+
+        # LoRA适配器存储（字典结构）
         self.adapters = {}
         self.active = []
-        self.runtime = {}
-        self.runtime_mask = {}
-        
-    def bind_runtime(self, name: str, A: torch.Tensor, B: torch.Tensor):
-        self.runtime[name] = (A, B)
-
-    def clear_runtime(self):
-        self.runtime.clear()
-    
-    def bind_token_mask(self, name: str, mask: torch.Tensor):
-        self.runtime_mask[name] = mask
-
-    def clear_token_masks(self):
-        self.runtime_mask.clear()
+        self.runtime_weights = {}
+        # token_masks keyed by adapter name; values are tensors
+        self.token_masks = {}
 
     def add_adapter(self, name: str, rank: int, alpha: float = 8.0, trainable: bool = True):
+        """添加一个LoRA适配器"""
         assert name not in self.adapters, f"Adapter {name} already exists"
-        dev, dt = self.original_module.weight.device, self.original_module.weight.dtype
-        
+
+        device = self.original_module.weight.device
+        dtype = self.original_module.weight.dtype
+
         if trainable:
-            A = nn.Parameter(torch.zeros(self.out_features, rank, device=dev, dtype=dt))
-            B = nn.Parameter(torch.zeros(rank, self.in_features, device=dev, dtype=dt))
+            A = nn.Parameter(torch.zeros(self.out_features, rank, device=device, dtype=dtype))
+            B = nn.Parameter(torch.zeros(rank, self.in_features, device=device, dtype=dtype))
             nn.init.kaiming_uniform_(A, a=math.sqrt(5))
             nn.init.kaiming_uniform_(B, a=math.sqrt(5))
         else:
-            A = nn.Parameter(torch.zeros(self.out_features, rank, device=dev, dtype=dt), requires_grad=False)
-            B = nn.Parameter(torch.zeros(rank, self.in_features, device=dev, dtype=dt), requires_grad=False)
+            A = nn.Parameter(torch.zeros(self.out_features, rank, device=device, dtype=dtype),
+                           requires_grad=False)
+            B = nn.Parameter(torch.zeros(rank, self.in_features, device=device, dtype=dtype),
+                           requires_grad=False)
 
-        self.adapters[name] = {"A": A, "B": B, "alpha": alpha, "rank": rank, "trainable": trainable}
+        self.adapters[name] = {
+            "A": A,
+            "B": B,
+            "alpha": alpha,
+            "rank": rank,
+            "trainable": trainable
+        }
+
+        # 注册参数（即便是不可训练的，我们也注册以便保存/加载）
         self.register_parameter(f"{name}_A", A)
         self.register_parameter(f"{name}_B", B)
-        
+
+    def bind_runtime(self, name: str, A: torch.Tensor, B: torch.Tensor):
+        """绑定运行时权重（用于LE适配器）"""
+        self.runtime_weights[name] = (A, B)
+
+    def bind_token_mask(self, name: str, mask: torch.Tensor):
+        """绑定token级别的mask，存储 clone 以避免后续外部修改影响内部"""
+        # 保证 mask 是 float32 在正确设备上
+        if not isinstance(mask, torch.Tensor):
+            mask = torch.tensor(mask, dtype=torch.float32, device=next(self.parameters()).device)
+        mask = mask.to(dtype=torch.float32, device=next(self.parameters()).device)
+        self.token_masks[name] = mask.clone()
+
+    def clear_runtime(self):
+        """清除运行时权重"""
+        self.runtime_weights.clear()
+
+    def clear_token_masks(self):
+        """清除token masks"""
+        self.token_masks.clear()
+
     def set_adapter_weights(self, name: str, A: torch.Tensor, B: torch.Tensor, alpha: float = None):
+        """直接设置适配器权重（用于持久化）"""
         assert name in self.adapters, f"Adapter {name} not found"
-        assert not self.adapters[name]["trainable"], "Use optimizer to update trainable adapters"
+        assert not self.adapters[name]["trainable"], "不能直接设置可训练适配器的权重"
+
         A_dst = self.adapters[name]["A"]
         B_dst = self.adapters[name]["B"]
-        assert A.shape == A_dst.shape and B.shape == B_dst.shape
+
+        assert A.shape == A_dst.shape, f"A shape mismatch: {A.shape} vs {A_dst.shape}"
+        assert B.shape == B_dst.shape, f"B shape mismatch: {B.shape} vs {B_dst.shape}"
+
         with torch.no_grad():
             A_dst.copy_(A.to(A_dst.device, dtype=A_dst.dtype))
             B_dst.copy_(B.to(B_dst.device, dtype=B_dst.dtype))
             if alpha is not None:
                 self.adapters[name]["alpha"] = float(alpha)
-        
-    def disable_all(self):
-        self.active = []
-        
+
     def enable_adapters(self, names):
+        """激活指定的适配器"""
         self.active = list(names)
 
-    def forward(self, x: torch.Tensor):
-        weight = self.original_module.weight.t()
-        base_output = F.linear(x, weight, 
-                         self.original_module.bias if self.bias else None)
+    def disable_all(self):
+        """禁用所有适配器"""
+        self.active = []
 
-        for name in self.active:
-            ad = self.adapters[name]
-            
-            A_param = ad["A"]; B_param = ad["B"]
-            A_rt, B_rt = self.runtime.get(name, (None, None))
-            A_use = A_rt if A_rt is not None else A_param
-            B_use = B_rt if B_rt is not None else B_param
-        
-            lora_output = (ad["alpha"] / ad["rank"]) * F.linear(F.linear(x, B_use), A_use)
-            base_output = base_output + lora_output
+    def forward(self, x: torch.Tensor):
+        """
+        前向传播
+        x: [batch_size, seq_len, in_features]
+        返回: [batch_size, seq_len, out_features]
+        """
+        # 基础输出（与原始权重）
+        weight = self.original_module.weight  # [out_features, in_features]
+        if self.has_bias:
+            bias = self.original_module.bias
+            base_output = torch.einsum('bsi,io->bso', x, weight) + bias
+        else:
+            base_output = torch.einsum('bsi,io->bso', x, weight)
+
+        # 应用激活的LoRA适配器
+        for adapter_name in self.active:
+            if adapter_name in self.adapters:
+                adapter = self.adapters[adapter_name]
+
+                # 获取权重（优先使用运行时权重）
+                if adapter_name in self.runtime_weights:
+                    A, B = self.runtime_weights[adapter_name]
+                else:
+                    A, B = adapter["A"], adapter["B"]
+
+                # LoRA 计算: Δy = scale * (x @ B.T) @ A.T
+                scale = adapter["alpha"] / max(1, adapter["rank"])
+
+                # 第一步：x @ B.T -> [batch, seq, rank]
+                intermediate = torch.einsum('bsi,ri->bsr', x, B)
+
+                # 第二步：intermediate @ A.T -> [batch, seq, out]
+                lora_output = torch.einsum('bsr,or->bso', intermediate, A)
+                lora_output = scale * lora_output
+
+                # 如果该 adapter 有 token mask，按位置应用
+                if adapter_name in self.token_masks:
+                    mask = self.token_masks[adapter_name]
+                    # 标准化维度为 [batch, seq, 1]
+                    if mask.dim() == 2:
+                        mask = mask.unsqueeze(-1)
+                    elif mask.dim() == 3 and mask.shape[-1] != 1:
+                        mask = mask[..., :1]
+                    # 广播相乘（确保 device/dtype 匹配）
+                    lora_output = lora_output * mask.to(dtype=lora_output.dtype, device=lora_output.device)
+
+                base_output = base_output + lora_output
 
         return base_output
+# ---------- REPLACE Conv1DLoRA.__init__ AND Conv1DLoRA.forward END ----------
+
 
 def get_parent_and_attr(model: nn.Module, dotted: str):
     parts = dotted.split(".")
@@ -171,32 +246,51 @@ def get_parent_and_attr(model: nn.Module, dotted: str):
             parent = getattr(parent, p)
     return parent, parts[-1]
 
-def replace_linear_with_lora(model: nn.Module, target_layers: List[str],
-                                   lf_rank=8, le_rank=8, alpha=8.0):
+def replace_conv1d_with_lora(model: nn.Module, target_layers: List[str],
+                            lf_rank=8, le_rank=8, alpha=8.0):
+    """
+    将指定的Conv1D层替换为Conv1DLoRA层
+    """
     lora_hosts = {}
     
-    print(f"[DEBUG] Looking for layers: {target_layers}")
+    print(f"[ADIT] Looking for Conv1D layers: {target_layers}")
+    
     for full_name, module in model.named_modules():
-        
         if full_name in target_layers:
-            print(f"[DEBUG] Found target layer: {full_name}, type: {type(module)}")
+            print(f"[ADIT] Found target layer: {full_name}, type: {type(module)}")
+            print(f"[ADIT] Module weight shape: {module.weight.shape}")
             
-            if isinstance(module, LoRALinear):
-                print(f"[DEBUG] Layer {full_name} is already LoRALinear, reusing")
+            # 检查是否已经是Conv1DLoRA
+            if isinstance(module, Conv1DLoRA):
+                print(f"[ADIT] Layer {full_name} is already Conv1DLoRA, reusing")
                 lora_hosts[full_name] = module
-            elif hasattr(module, 'weight') and len(module.weight.shape) == 2:
-                print(f"[DEBUG] Replacing original layer: {full_name}")
+                continue
+            
+            # 检查是否是Conv1D层（GPT-2风格）
+            if hasattr(module, 'weight') and len(module.weight.shape) == 2:
+                print(f"[ADIT] Replacing Conv1D layer: {full_name}")
+                print(module.weight.shape)
+               
+                # 获取父模块和属性名
                 parent, attr = get_parent_and_attr(model, full_name)
-                host = LoRALinear(module)
+                
+                # 创建Conv1DLoRA包装器
+                host = Conv1DLoRA(module)
+                
+                # 添加两个适配器：LF（可训练）和 LE（不可训练）
                 host.add_adapter("LF", rank=lf_rank, alpha=alpha, trainable=True)
                 host.add_adapter("LE", rank=le_rank, alpha=alpha, trainable=False)
+                
+                # 移动到正确的设备
                 host.to(module.weight.device, dtype=module.weight.dtype)
+                
+                # 替换原模块
                 setattr(parent, attr, host)
                 lora_hosts[full_name] = host
             else:
-                print(f"[DEBUG] Layer {full_name} is not a replaceable module")
+                print(f"[WARNING] Layer {full_name} is not a Conv1D layer")
     
-    print(f"[ADIT] Replaced/Found {len(lora_hosts)} layers with LoRA")
+    print(f"[ADIT] Successfully replaced {len(lora_hosts)} layers with Conv1DLoRA")
     return lora_hosts
 
 class PerLayerGate(nn.Module):
@@ -216,7 +310,7 @@ class PerLayerGate(nn.Module):
         return gA, gB
 
 class HyperNetwork(nn.Module):
-    def __init__(self, lora_hosts: Dict[str, LoRALinear], ctx_dim: int, rank: int = 8, hidden: int = 256):
+    def __init__(self, lora_hosts: Dict[str, Conv1DLoRA], ctx_dim: int, rank: int = 8, hidden: int = 256):
         super().__init__()
         self.rank = rank
         self.ctx_dim = ctx_dim
@@ -224,30 +318,49 @@ class HyperNetwork(nn.Module):
         self.base_A = nn.ParameterDict()
         self.base_B = nn.ParameterDict()
         self.heads = nn.ModuleDict()
-
+        
         for name, host in lora_hosts.items():
-            assert host.adapters["LE"]["rank"] == rank, f"Rank mismatch at {name}"
-            A0 = nn.Parameter(torch.empty(host.out_features, rank))
-            B0 = nn.Parameter(torch.empty(rank, host.in_features))
+            # 验证适配器存在且秩匹配
+            assert "LE" in host.adapters, f"LE adapter not found in layer {name}"
+            assert host.adapters["LE"]["rank"] == rank, f"Rank mismatch at {name}: {host.adapters['LE']['rank']} != {rank}"
+            
+            # 获取维度信息
+            out_features = host.out_features
+            in_features = host.in_features
+            
+            # 初始化基础权重
+            A0 = nn.Parameter(torch.empty(out_features, rank))
+            B0 = nn.Parameter(torch.empty(rank, in_features))
             nn.init.kaiming_uniform_(A0, a=math.sqrt(5))
             nn.init.kaiming_uniform_(B0, a=math.sqrt(5))
+            
+            # 使用安全的关键字
             key = name.replace(".", "_")
             self.base_A[key] = A0
             self.base_B[key] = B0
+            
+            # 门控网络
             self.heads[key] = PerLayerGate(ctx_dim, rank, hidden)
-
+            
     def forward(self, ctx: torch.Tensor) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
         out: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+        
         for name in self.layer_names:
             key = name.replace(".", "_")
-            gA, gB = self.heads[key](ctx)
-            A0 = self.base_A[key]
-            B0 = self.base_B[key]
-            gA1 = gA[0].view(1, -1)
-            gB1 = gB[0].view(-1, 1)
-            A = A0 * gA1
-            B = gB1 * B0
+            
+            # 生成门控参数
+            gA, gB = self.heads[key](ctx)  # gA: [1, rank], gB: [1, rank]
+            
+            # 获取基础权重
+            A0 = self.base_A[key]  # [out_features, rank]
+            B0 = self.base_B[key]  # [rank, in_features]
+            
+            # 应用门控
+            A = A0 * gA.view(1, -1)  # [out_features, rank] * [1, rank]
+            B = B0 * gB.view(-1, 1)  # [rank, in_features] * [rank, 1]
+            
             out[name] = (A, B)
+            
         return out
 
 class TokenHelper:
@@ -305,7 +418,7 @@ class ADITEditor:
         self.hparams = hparams
 
         # Replace target layers with LoRA
-        self.lora_hosts = replace_linear_with_lora(
+        self.lora_hosts = replace_conv1d_with_lora(
             self.base_model, target_layers, lf_rank=hparams.lf_rank, le_rank=hparams.le_rank, alpha=hparams.alpha
         )
 
@@ -336,6 +449,7 @@ class ADITEditor:
         
         # Vector guidance storage
         self.vector_cache = {}  # 缓存精准向量
+        self._ks_proj_map = {}  
 
     def _activate(self, adapters, *_, **__):
         for host in self.lora_hosts.values():
@@ -359,10 +473,12 @@ class ADITEditor:
                 continue
                 
             # 为每个编辑层计算向量
+            
             for layer in self.hparams.layers:
                 # 获取上下文模板
                 templates = self.get_specific_context_templates(request)
-                print(templates)
+                if templates is None:
+                    templates=[]
                 try:
                     # 1. 计算subject在该层的输入表示 (compute_ks)
                     ks_vector = compute_ks(
@@ -405,45 +521,132 @@ class ADITEditor:
                     }
         
         print(f"[ADIT] Cached vectors for {len(requests)} requests, {len(self.vector_cache)} entries")
+        
+    def _get_or_create_ks_proj(self, ks_dim: int) -> torch.Tensor:
+        """
+        返回把 ks_dim -> ctx_dim 的投影矩阵（tensor），若不存在则创建并缓存。
+        该矩阵是固定的随机矩阵（非可训练参数）。
+        """
+        ctx_dim = int(self.hparams.ctx_dim)
+        device = self.hparams.device if isinstance(self.hparams.device, str) else self.hparams.device
 
+        # 如果已经存在并形状匹配，直接返回
+        existing = self._ks_proj_map.get(ks_dim, None)
+        if existing is not None:
+            # 确保在正确 device
+            if existing.device != torch.device(device):
+                existing = existing.to(device)
+                self._ks_proj_map[ks_dim] = existing
+            return existing
+
+        # 否则创建新的随机投影矩阵
+        # 初始化标准差 scaled by sqrt(1/ks_dim)
+        std = 1.0 / (ks_dim ** 0.5)
+        P = torch.randn(ks_dim, ctx_dim, device=device, dtype=torch.float32) * std
+
+        # 存入缓存并返回
+        self._ks_proj_map[ks_dim] = P
+        return P
+
+
+    # ---------- REPLACE get_specific_context_templates START ----------
     def get_specific_context_templates(self, request):
-      """为特定事实类型生成相关模板"""
-      subject = request.get('subject', '')
-    
-    # 基于request内容生成模板，不重复原始模板
-      original_prompt = request['prompt']  # 如：'The mother tongue of {} is'
-    
-    # 提取核心部分用于生成相关模板
-      if "mother tongue" in original_prompt.lower() or "language" in original_prompt.lower():
-        # 不要包含原始模板，只生成相关变体
-        templates = [
-            "{}'s native language is", 
-            "The primary language of {} is",
-            "What language does {} speak?",
-            "{} speaks",
-        ]
-      elif "capital" in original_prompt.lower():
-         templates = [
-            "{}'s capital city is",
-            "The capital city of {} is", 
-            "What is the capital of {}?",
-        ]
-      elif "born" in original_prompt.lower() or "birth" in original_prompt.lower():
-        templates = [
-            "{} was born in",
-            "The birthplace of {} is",
-            "{} originated from",
-            "Where was {} born?",
-        ]
-      else:
-        # 通用模板变体
-        templates = [
-            "{} is known for",
-            "About {}:",
-            "Facts about {}:",
-        ]
-    
-      return templates  # ✅ 返回单层列表
+        """为特定事实类型生成相关模板"""
+        # 尝试直接使用 paraphrase_prompts 字段（counterfact 风格）
+        paraphrases = request.get("paraphrase_prompts", None)
+        templates = []
+
+        if paraphrases:
+            # 统一转换为列表
+            if isinstance(paraphrases, str):
+                paraphrases = [paraphrases]
+            elif isinstance(paraphrases, (list, tuple)):
+                paraphrases = [p for p in paraphrases if isinstance(p, str)]
+            else:
+                paraphrases = []
+
+            subject = request.get("subject", "").strip()
+            
+            # 处理每个paraphrase模板
+            for p in paraphrases:
+                p = p.strip()
+                if not p:
+                    continue
+                
+                # 检查是否已经包含 {}
+                if "{}" in p:
+                    templates.append(p)
+                    continue
+                
+                # 如果包含 subject，替换为 {}
+                if subject and subject in p:
+                    temp = p.replace(subject, "{}")
+                    templates.append(temp)
+                else:
+                    # 如果不包含 subject 也不包含 {}，直接使用（假设用户写的是模板句）
+                    templates.append(p)
+        
+            # 去重
+            if templates:
+                seen = set()
+                unique = []
+                for t in templates:
+                    if t not in seen:
+                        unique.append(t)
+                        seen.add(t)
+                
+                if unique:
+                    # 调试输出
+                    print(f"[DEBUG] Using paraphrase templates for subject '{subject}':")
+                    for i, t in enumerate(unique[:5]):  # 只显示前5个
+                        print(f"  Template {i}: '{t}'")
+                    if len(unique) > 5:
+                        print(f"  ... and {len(unique)-5} more")
+                    
+                    return unique
+
+        # 如果 paraphrase_prompts 不存在或处理失败，fallback 到原来的手写变体逻辑
+        original_prompt = request.get('prompt', '') or ''
+        lower = original_prompt.lower()
+
+        if "mother tongue" in lower or "language" in lower:
+            templates = [
+                "{}'s native language is",
+                "The primary language of {} is",
+                "What language does {} speak?",
+                "{} speaks",
+            ]
+        elif "capital" in lower:
+            templates = [
+                "{}'s capital city is",
+                "The capital city of {} is",
+                "What is the capital of {}?",
+            ]
+        elif "born" in lower or "birth" in lower:
+            templates = [
+                "{} was born in",
+                "The birthplace of {} is",
+                "{} originated from",
+                "Where was {} born?",
+            ]
+        else:
+            # 通用回退模板
+            templates = [
+                "{} is known for",
+                "About {}:",
+                "Facts about {}:",
+                "The thing about {} is",
+            ]
+        
+        # 调试输出
+        subject = request.get('subject', '').strip()
+        if subject:
+            print(f"[DEBUG] Using fallback templates for subject '{subject}':")
+            for i, t in enumerate(templates[:3]):
+                print(f"  Template {i}: '{t}'")
+        
+        return templates
+
 
     def build_guided_context(self, batch: BatchItem, request: Dict) -> torch.Tensor:
         """构建带向量指导的上下文"""
@@ -461,12 +664,27 @@ class ADITEditor:
                 layer = self.hparams.layers[0]
                 cache_key = f"{subject}_layer{layer}"
                 
-                if cache_key in self.vector_cache:
-                    ks_vector = self.vector_cache[cache_key]['ks'].to(self.hparams.device)
-                    # 将subject表示融入上下文（加权融合）
-                    alpha = self.hparams.vector_guidance_weight
-                    guided_ctx = base_ctx + alpha * ks_vector.unsqueeze(0)
-                    return guided_ctx
+            if cache_key in self.vector_cache:
+                ks_vector = self.vector_cache[cache_key]['ks']  # 可能在 CPU 上
+                # 确保 ks_vector 在 device 上并为 float32
+                ks_vector = ks_vector.to(self.hparams.device).to(dtype=torch.float32)
+
+                # 如果 ks_vector 长度等于 ctx_dim，直接用；否则通过随机投影映射到 ctx_dim
+                ks_dim = ks_vector.numel()
+                ctx_dim = int(self.hparams.ctx_dim)
+
+                if ks_dim == ctx_dim:
+                    ks_mapped = ks_vector
+                else:
+                    P = self._get_or_create_ks_proj(ks_dim)  # [ks_dim, ctx_dim]
+                    # ks_vector: [ks_dim]; mapped: [ctx_dim]
+                    ks_mapped = torch.matmul(ks_vector.view(1, ks_dim), P).view(-1)
+
+                # 融合（注意类型/设备一致）
+                alpha = float(self.hparams.vector_guidance_weight)
+                guided_ctx = base_ctx + alpha * ks_mapped.unsqueeze(0)
+                return guided_ctx
+
             
             return base_ctx
             
@@ -489,6 +707,60 @@ class ADITEditor:
         except:
             # 回退
             return torch.randn(1, self.hparams.ctx_dim, device=self.hparams.device)
+    def compute_neighbor_loss(self, batch_item: BatchItem, le_weights: Dict) -> torch.Tensor:
+        """计算邻居prompts上的稳定性损失"""
+        if not batch_item.neighbor_prompts:
+            return torch.tensor(0.0, device=self.hparams.device)
+        
+        total_loss = 0.0
+        neighbor_count = 0
+        
+        # 为每个邻居prompt计算损失
+        for neighbor_prompt in batch_item.neighbor_prompts:
+            if not neighbor_prompt or not isinstance(neighbor_prompt, str):
+                continue
+            
+            try:
+                # 1. 注入LE权重到所有LoRA层
+                for layer_name, host in self.lora_hosts.items():
+                    if layer_name in le_weights:
+                        A, B = le_weights[layer_name]
+                        host.bind_runtime("LE", A, B)
+                
+                # 2. 获取基础模型的输出（无编辑）
+                self._deactivate_all()
+                with torch.no_grad():
+                    ids_base, attn_base = self.tok.encode(neighbor_prompt, self.hparams.device)
+                    if attn_base is None:
+                        attn_base = torch.ones_like(ids_base)
+                    logits_base = self.base_model(input_ids=ids_base, attention_mask=attn_base).logits
+                
+                # 3. 获取编辑后的输出（激活LE）
+                self._activate(["LE"])
+                logits_edit = self.base_model(input_ids=ids_base, attention_mask=attn_base).logits
+                
+                # 4. 计算KL散度损失
+                P = F.softmax(logits_base, dim=-1)  # 基础分布
+                Q_log = F.log_softmax(logits_edit, dim=-1)  # 编辑后log分布
+                loss = F.kl_div(Q_log, P, reduction="batchmean", log_target=False)
+                
+                total_loss += loss
+                neighbor_count += 1
+                
+            except Exception as e:
+                print(f"[WARN] Failed to compute neighbor loss for prompt '{neighbor_prompt[:50]}...': {e}")
+                continue
+            
+            finally:
+                # 清理运行时权重
+                for host in self.lora_hosts.values():
+                    host.clear_runtime()
+                self._deactivate_all()
+        
+        # 返回平均损失
+        if neighbor_count > 0:
+            return total_loss / neighbor_count
+        return torch.tensor(0.0, device=self.hparams.device)
 
     def step_forget_batch(self, items: list, clip_norm: float = 1.0):
         """遗忘步骤（保持不变）"""
@@ -536,59 +808,53 @@ class ADITEditor:
             "forget/kl_loc": log_kl / max(1, len(items)),
         }
 
+    # ---------- REPLACE entire step_edit_batch_with_guidance body START ----------
     def step_edit_batch_with_guidance(self, items: list, requests: List[Dict], clip_norm: float = 1.0):
-        """使用向量指导的编辑步骤"""
+        """使用向量指导的编辑步骤（包含邻居损失）"""
         self.opt_le.zero_grad(set_to_none=True)
         total_loss = 0.0
         log_ce = 0.0
-        log_vector = 0.0  # 向量对齐损失
+        log_vector = 0.0
+        log_neighbor = 0.0  # 新增：邻居损失日志
 
         for i, (bi, request) in enumerate(zip(items, requests)):
-            # 使用向量指导的上下文
+            # 使用向量指导的上下文（hyper -> LE 权重）
             ctx = self.build_guided_context(bi, request)
             le_weights = self.hyper(ctx)
-            
+
+            # 将 LE 权重注入每个 host
             for name, host in self.lora_hosts.items():
                 A, B = le_weights[name]
                 host.bind_runtime("LE", A, B)
 
-            # 使用精准位置信息
-            subject = bi.subject
-            lookup_idx = find_fact_lookup_idx(
-                bi.prompt_template,
-                subject,
-                self.tokenizer,
-                self.hparams.fact_token,
-                verbose=False
-            )
-            
+            # 编码用于 LM 训练 / 生成的 ids
             ids, attn, labels = self.tok.encode_label_for_target(bi.prompt_formatted, bi.target_new, self.hparams.device)
-            
-            # 创建精准mask，只在事实位置应用编辑
-            tok_mask = torch.zeros_like(ids, dtype=torch.float32, device=self.hparams.device).unsqueeze(-1)
-            if lookup_idx < tok_mask.shape[1]:
-                tok_mask[:, lookup_idx:, :] = 1.0
-                
-            for host in self.lora_hosts.values():
-                host.bind_token_mask("LE", tok_mask)
 
+            # 激活 LE 并计算语言模型损失
             self._deactivate_all()
             self._activate(["LE"])
-            
-            # 基础损失：语言模型损失
             ce_new = lm_ce_loss(self.base_model, ids, attn, labels)
+
+            # 向量对齐损失
+            vector_loss = self.compute_vector_alignment_loss(bi, request) if self.hparams.use_vector_guidance else 0.0
+
+            # 新增：邻居损失
+            neighbor_loss = self.compute_neighbor_loss(bi, le_weights)
+
+            # 总损失 = CE损失 + 向量对齐损失 + 邻居损失
+            loss_i = (
+                ce_new + 
+                self.hparams.vector_alignment_weight * vector_loss + 
+                self.hparams.lambda_neighbor * neighbor_loss
+            )
             
-            # 向量对齐损失（如果启用）
-            vector_loss = self.compute_vector_alignment_loss(bi, request, lookup_idx) if self.hparams.use_vector_guidance else 0.0
-            
-            # 总损失
-            loss_i = ce_new + self.hparams.vector_alignment_weight * vector_loss
             total_loss = total_loss + loss_i
-            
+
             log_ce += float(ce_new.detach().cpu())
             log_vector += float(vector_loss.detach().cpu()) if isinstance(vector_loss, torch.Tensor) else 0.0
+            log_neighbor += float(neighbor_loss.detach().cpu())  # 记录邻居损失
 
-            # 清理
+            # 清理运行时权重
             for host in self.lora_hosts.values():
                 host.clear_runtime()
                 host.clear_token_masks()
@@ -599,78 +865,129 @@ class ADITEditor:
         torch.nn.utils.clip_grad_norm_(self.hyper.parameters(), clip_norm)
         self.opt_le.step()
 
-        metrics = {"edit/ce_new": log_ce / max(1, len(items))}
+        # 返回包含邻居损失的指标
+        metrics = {
+            "edit/ce_new": log_ce / max(1, len(items)),
+            "edit/neighbor_loss": log_neighbor / max(1, len(items))  # 新增指标
+        }
         if self.hparams.use_vector_guidance:
             metrics["edit/vector_loss"] = log_vector / max(1, len(items))
         return metrics
 
-    def compute_vector_alignment_loss(self, batch: BatchItem, request: Dict, lookup_idx: int):
-        """计算向量对齐损失"""
+
+    # ---------- REPLACE compute_vector_alignment_loss START ----------
+    def compute_vector_alignment_loss(self, batch: BatchItem, request: Dict):
+        """计算向量对齐损失（ROME-style，基于 subject 的实际 token 位置）"""
         if not self.hparams.use_vector_guidance:
             return torch.tensor(0.0, device=self.hparams.device)
-        
+
         subject = batch.subject
         if not subject:
             return torch.tensor(0.0, device=self.hparams.device)
-        
+
         total_loss = 0.0
         layer_count = 0
-        
+
         for layer in self.hparams.layers:
             cache_key = f"{subject}_layer{layer}"
             if cache_key not in self.vector_cache:
                 continue
-                
-            # 获取目标向量
+
+            # 目标向量（来自 compute_z）
             target_vector = self.vector_cache[cache_key]['z'].to(self.hparams.device)
-            
-            # 追踪该层的实际输出
+
+            # 要监控的层名称
             layer_name = f"transformer.h.{layer}.mlp.c_proj"
-            
-            # 准备输入（只包含prompt，用于计算实际输出）
+
+            # 准备输入：使用 batch.prompt_formatted（已经 format 了 subject）
             prompt_text = batch.prompt_formatted
-            input_ids = self.tokenizer(prompt_text, return_tensors="pt")["input_ids"].to(self.hparams.device)
-            
-            # 临时激活LE以获取编辑后的输出
+            enc = self.tokenizer(prompt_text, return_tensors="pt")
+            input_ids = enc["input_ids"].to(self.hparams.device)
+            attn_mask = enc.get("attention_mask", None)
+            if attn_mask is not None:
+                attn_mask = attn_mask.to(self.hparams.device)
+
+            # 找到 subject 在 prompt_text 中的 token 索引（使用你的 find_fact_lookup_idx 工具）
+            # 这里我们调用 find_fact_lookup_idx，但传入 prompt_formatted，确保定位的是实际输入位置
+            try:
+                lookup_idx = find_fact_lookup_idx(
+                    batch.prompt_template,  # 传入 template 以保持原有策略（某些实现可能需要）
+                    subject,
+                    self.tokenizer,
+                    self.hparams.fact_token,
+                    verbose=False
+                )
+            except Exception:
+                # 若 find_fact_lookup_idx 不是对 formatted prompt 工作良好，则退回到在 input_ids 中查找 token span:
+                lookup_idx = None
+
+            # 如果 find_fact_lookup_idx 未能给出稳健位置，我们尝试在 tokenizer 的 input_ids 里寻找 subject 的 token span
+            if lookup_idx is None:
+                # tokenise subject and search as subsequence
+                subj_ids = self.tokenizer(subject, add_special_tokens=False)["input_ids"]
+                subj_len = len(subj_ids)
+                seq = input_ids[0].tolist()
+                found = -1
+                for i in range(0, len(seq) - subj_len + 1):
+                    if seq[i:i + subj_len] == subj_ids:
+                        found = i
+                        break
+                if found >= 0:
+                    lookup_idx = found
+                else:
+                    # fallback: use last token
+                    lookup_idx = input_ids.shape[1] - 1
+
+            # 清理 runtime 状态，确保我们测量的是在只注入 LE 权重时的输出
+            for host in self.lora_hosts.values():
+                host.clear_runtime()
+                host.clear_token_masks()
+
+            # 临时激活 LE：将 hyper 网络在当前 ctx 上生成的权重注入（注意这里不用 mask）
             self._activate(["LE"])
             with torch.no_grad():
-                # 注意：这里需要重新绑定权重
                 ctx = self.build_guided_context(batch, request)
                 le_weights = self.hyper(ctx)
+                # Bind runtime weights only for this measurement
                 if layer_name in self.lora_hosts:
                     A, B = le_weights[layer_name]
                     self.lora_hosts[layer_name].bind_runtime("LE", A, B)
-                
-                # 追踪输出
-                with nethook.TraceDict(
-                    self.base_model,
-                    layers=[layer_name],
-                    retain_output=True
-                ) as tr:
-                    _ = self.base_model(input_ids=input_ids)
-                    
+
+                # Trace layer output
+                with nethook.TraceDict(self.base_model, layers=[layer_name], retain_output=True) as tr:
+                    _ = self.base_model(input_ids=input_ids, attention_mask=attn_mask)
                     if layer_name in tr:
                         layer_output = tr[layer_name].output
                         if isinstance(layer_output, tuple):
                             layer_output = layer_output[0]
-                        
-                        # 获取subject位置的实际输出
-                        if lookup_idx < layer_output.shape[1]:
-                            actual_vector = layer_output[0, lookup_idx, :]
-                            
-                            # 计算对齐损失
-                            loss = F.mse_loss(actual_vector, target_vector)
-                            total_loss += loss
-                            layer_count += 1
-            
-            # 清理
+
+                        # layer_output: [batch, seq_len, hidden]
+                        batch_size, seq_len, hidden_size = layer_output.shape
+
+                        # bounds check for lookup_idx
+                        if lookup_idx >= seq_len:
+                            actual_idx = seq_len - 1
+                        else:
+                            actual_idx = lookup_idx
+
+                        actual_vector = layer_output[0, actual_idx, :]
+
+                        loss = F.mse_loss(actual_vector, target_vector)
+                        total_loss += loss
+                        layer_count += 1
+
+            # 清理 runtime injection for this layer
             if layer_name in self.lora_hosts:
                 self.lora_hosts[layer_name].clear_runtime()
+                self.lora_hosts[layer_name].clear_token_masks()
+
             self._deactivate_all()
-        
+
         if layer_count > 0:
             return total_loss / layer_count
         return torch.tensor(0.0, device=self.hparams.device)
+# ---------- REPLACE compute_vector_alignment_loss END ----------
+
 
     def train_multiedit_with_guidance(self, items: list, requests: List[Dict], epochs: int = 1,
                                     bs_forget: int = 4, bs_edit: int = 4,
@@ -830,7 +1147,8 @@ def apply_ADIT_to_model(
         model = model.float()
     else:
         print(f"[ADIT] Model already in float32, no conversion needed")
-
+    
+    print(requests)
     # 检查是否已经存在编辑器
     if hasattr(model, '_adit_editor'):
         print("[ADIT] Reusing existing editor, training on new requests")
@@ -864,6 +1182,7 @@ def apply_ADIT_to_model(
     target_new=_norm_target(target_new),
     locality_prompts=request.get('locality_prompts', []) or [],
     neighbor_prompts=request.get('neighbor_prompts', []) or [],
+    paraphrase_prompts=request.get('paraphrase_prompts',[]) or [],
 ))
         
         # 使用向量指导训练
@@ -906,6 +1225,7 @@ def apply_ADIT_to_model(
     target_new=_norm_target(target_new),
     locality_prompts=request.get('locality_prompts', []) or [],
     neighbor_prompts=request.get('neighbor_prompts', []) or [],
+    paraphrase_prompts=request.get('paraphrase_prompts',[]) or [],
 ))
 
     # Build target layers

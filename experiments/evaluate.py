@@ -86,10 +86,12 @@ def evaluate_with_editor(editor: ADITEditor, record: Dict, ds_eval_method,
         class EvalBatchItem:
             prompt: str
             target_new: str
+            subject:str
         
         # 创建临时BatchItem对象
         eval_item = EvalBatchItem(
             prompt=batch_data['prompt_formatted'],
+            subject=batch_data['subject'],
             target_new=batch_data['target_new']
         )
         
@@ -266,20 +268,30 @@ def main(
         
         # 准备请求数据
         requests = []
+
         for record in record_chunks:
             requested_rewrite = record["requested_rewrite"]
+    
+    # 从record顶层获取paraphrase_prompts
+            paraphrase_prompts = record.get("paraphrase_prompts", [])
+            neighbor_prompts=record.get("neighborhood_prompts",[])
+            print(neighbor_prompts)
+            
             if isinstance(requested_rewrite, list):
                 for rewrite in requested_rewrite:
                     requests.append({
-                        "case_id": record["case_id"],
-                        **rewrite
-                    })
+                "case_id": record["case_id"],
+                **rewrite,
+                "paraphrase_prompts": paraphrase_prompts,
+                "neighbor_prompts":neighbor_prompts# ✅ 添加
+            })
             else:
                 requests.append({
-                    "case_id": record["case_id"],
-                    **requested_rewrite
-                })
-        
+            "case_id": record["case_id"],
+            **requested_rewrite,
+            "paraphrase_prompts": paraphrase_prompts,
+           "neighbor_prompts":neighbor_prompts# ✅ 添加
+        })
         print(f"Applying ADIT with vector guidance={use_vector_guidance}")
         edited_model, editor = apply_algo(
             model,

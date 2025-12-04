@@ -48,6 +48,7 @@ class ADITHyperParams(HyperParams):
     lambda_kl: float = 0.2        # KL散度权重
     lambda_spec: float = 0.1      # 特异性损失权重  
     lambda_orth: float = 0.005    # 正交性损失权重
+    lambda_neighbor:float=0.2
     kl_factor: float = 1.0        # KL因子
     
     # ====== 训练约束 ======
@@ -77,6 +78,9 @@ class ADITHyperParams(HyperParams):
     batch_size_edit: int = 4                # 编辑批次大小
     edit_per_forget: int = 3                # 每次遗忘对应的编辑次数
     
+    use_paraphrase_context: bool = True  # 是否使用paraphrase作为上下文
+    num_paraphrase_templates: int = 3    # 每次使用几个paraphrase模板
+    paraphrase_context_weight: float = 0.5  # paraphrase上下文的权重
     
     
     def __post_init__(self):
