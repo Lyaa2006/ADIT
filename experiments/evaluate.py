@@ -17,6 +17,7 @@ import torch
 import sys
 from pathlib import Path
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from dataclasses import dataclass, field
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -71,75 +72,53 @@ def create_batch_item_from_request(request: Dict) -> Dict:
 
 def evaluate_with_editor(editor: ADITEditor, record: Dict, ds_eval_method, 
                         gen_test_vars: List, generation_test_interval: int) -> Dict:
-    """使用ADIT编辑器进行评估"""
-    requested_rewrite = record["requested_rewrite"]
+    """使用ADIT编辑器进行评估 - 直接使用增强模型"""
     
-    # 创建评估用的BatchItem数据
-    batch_data = create_batch_item_from_request(requested_rewrite)
+    # 关键：使用editor.get_model_for_evaluation()返回的增强模型
+    enhanced_model = editor.get_model_for_evaluation()
     
-    # 准备评估（激活LE适配器）
-    try:
-        # 构建上下文
-        from dataclasses import dataclass
-        
-        @dataclass
-        class EvalBatchItem:
-            prompt: str
-            target_new: str
-            subject:str
-        
-        # 创建临时BatchItem对象
-        eval_item = EvalBatchItem(
-            prompt=batch_data['prompt_formatted'],
-            subject=batch_data['subject'],
-            target_new=batch_data['target_new']
-        )
-        
-        # 构建上下文并准备LE权重
-        ctx = editor.build_guided_context(eval_item, requested_rewrite)
-        le_weights = editor.hyper(ctx)
-        
-        # 绑定LE权重到所有LoRA主机
-        for name, host in editor.lora_hosts.items():
-            A, B = le_weights[name]
-            host.set_adapter_weights("LE", A, B)
-        
-        # 只激活LE适配器进行评估
-        editor._deactivate_all()
-        editor._activate(["LE"])
-        
-        # 执行评估
-        post_results = ds_eval_method(
-            editor.base_model,  # 使用基础模型，但已绑定LE权重
-            editor.tokenizer,
-            record,
-            *(
-                gen_test_vars
-                if record["case_id"] % generation_test_interval == 0
-                else [None, None]
-            ),
-        )
-        
-    except Exception as e:
-        print(f"[ERROR] Evaluation with editor failed: {e}")
-        # 回退到使用编辑后的模型
-        editor._deactivate_all()
-        post_results = ds_eval_method(
-            editor.base_model,  # 使用原始模型
-            editor.tokenizer,
-            record,
-            *(
-                gen_test_vars
-                if record["case_id"] % generation_test_interval == 0
-                else [None, None]
-            ),
-        )
-    finally:
-        # 清理：停用所有适配器
-        editor._deactivate_all()
+    # 这个enhanced_model的forward已经内置了动态LoRA生成
+    # 直接用它进行评估
+    
+    # 但是有一个问题：这个增强模型需要知道"当前要编辑哪个subject"
+    # 我们需要传递这个信息给模型
+    
+    # 解决方案1：在模型调用前设置当前subject
+    subject = record["requested_rewrite"]["subject"]
+    
+    # 创建一个包装器，在forward前设置当前subject
+    class SubjectAwareModelWrapper:
+        def __init__(self, enhanced_model, subject, editor):
+            self.enhanced_model = enhanced_model
+            self.subject = subject
+            self.editor = editor
+            # 复制属性
+            self.config = enhanced_model.config
+            
+        def __call__(self, **kwargs):
+            # 在forward前，设置当前要编辑的subject
+            # 这样enhanced_model就知道为谁生成LoRA
+            self.enhanced_model.current_subject = self.subject
+            
+            # 调用增强模型（它会动态生成LoRA）
+            return self.enhanced_model(**kwargs)
+    
+    # 创建包装器
+    model_wrapper = SubjectAwareModelWrapper(enhanced_model, subject, editor)
+    
+    # 进行评估
+    post_results = ds_eval_method(
+        model_wrapper,  # ← 使用包装器
+        editor.tokenizer,
+        record,
+        *(
+            gen_test_vars
+            if record["case_id"] % generation_test_interval == 0
+            else [None, None]
+        ),
+    )
     
     return post_results
-
 def main(
     alg_name: str,
     model_name: Union[str, Tuple],
@@ -275,7 +254,7 @@ def main(
     # 从record顶层获取paraphrase_prompts
             paraphrase_prompts = record.get("paraphrase_prompts", [])
             neighbor_prompts=record.get("neighborhood_prompts",[])
-            print(neighbor_prompts)
+           
             
             if isinstance(requested_rewrite, list):
                 for rewrite in requested_rewrite:
@@ -303,7 +282,7 @@ def main(
             vector_guidance_weight=vector_guidance_weight,
             vector_alignment_weight=vector_alignment_weight,
         )
-        
+        print(edited_model,editor)
         exec_time = time() - start
         cnt += 1
         print(f"Execution took {exec_time:.2f} seconds")
@@ -320,6 +299,7 @@ def main(
             try:
                 if editor is not None:
                     # 使用编辑器进行评估
+                    print("start")
                     print(f"Evaluating case {record['case_id']} with ADIT editor")
                     post_results = evaluate_with_editor(
                         editor, 
@@ -328,6 +308,7 @@ def main(
                         gen_test_vars,
                         generation_test_interval
                     )
+                    
                 else:
                     # 回退：使用编辑后的模型进行评估
                     print(f"Evaluating case {record['case_id']} with edited model")

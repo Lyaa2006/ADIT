@@ -15,119 +15,116 @@ def compute_ks(
     context_templates: List[str],  # 注意：这里是字符串列表，不是嵌套列表！
 ) -> torch.Tensor:
     """
-    ROME-style compute_ks:
-    ----------------------
-    为每个 request 生成若干带 subject 的上下文（如果没有 templates，回退到 prompt），
-    在指定 layer 上提取 module 输入表示（pre-MLP），并对同一 request 的多个模板取平均，
-    返回 shape [len(requests), hidden_size] 的 ks 矩阵（float tensor，device 与 model 相同）。
+    ADIT版本：计算键向量 - 修复模板处理问题
     """
+    print(f"ADIT: Computing key vectors for layer {layer}")
+    
+    # 🔥 调试：查看传入的模板
+    print(f"  [DEBUG] Received {len(context_templates)} templates")
+    for i, template in enumerate(context_templates[:3]):  # 只显示前3个
+        print(f"    Template[{i}]: {repr(template)}")
+    if len(context_templates) > 3:
+        print(f"    ... and {len(context_templates)-3} more")
 
-    device = next(model.parameters()).device
-    hidden_size = model.config.hidden_size
+    # 计算总处理量
+    total_contexts = len(context_templates)
+    total_processing = len(requests) * total_contexts
+    print(f"  Total contexts: {total_contexts}, requests: {len(requests)}")
 
-    # Build per-request formatted contexts and track counts per request
-    all_contexts = []   # flattened list of context strings (fully formatted or raw; get_module_input_output_at_words handles both)
-    all_words = []      # corresponding subject words (one per context)
-    counts = []         # number of contexts per request, to regroup later
-
-    # If context_templates is None or empty, we'll fallback to each request's prompt
-    templates_provided = bool(context_templates)
-
-    for req in requests:
-        subj = req.get("subject", "") or ""
-        # Determine templates for this request
-        if templates_provided:
-            # use provided templates list; allow non-string filtering
-            this_templates = [t for t in context_templates if isinstance(t, str) and t.strip()]
-            if not this_templates:
-                # fallback to prompt
-                this_templates = []
-        else:
-            this_templates = []
-
-        if not this_templates:
-            # fallback: use request['prompt'] if available, otherwise a generic template that includes subject
-            raw_prompt = req.get("prompt", "") or ""
-            if raw_prompt:
-                this_templates = [raw_prompt]
-            else:
-                # last resort: simple template
-                this_templates = ["{}"]
-
-        # For each template, prefer to keep it as-is (get_module_input_output_at_words will format
-        # if "{}" present); but to be robust, if template does not contain "{}" and does not contain subject,
-        # we append subject to ensure subject appears at inference time.
-        safe_templates = []
-        for t in this_templates:
+    # 构建上下文模板和词语列表
+    context_list = []
+    words_list = []
+    
+    for req_idx, request in enumerate(requests):
+        subject = request.get("subject", "")
+        if not subject:
+            print(f"  [WARN] Request {req_idx} has no subject, skipping")
+            continue
+            
+        # 🔥 修复：直接遍历模板列表，不要嵌套循环！
+        for template_idx, template in enumerate(context_templates):
+            # 确保template是字符串
+            if not isinstance(template, str):
+                print(f"  [ERROR] Template {template_idx} is not string: {type(template)}")
+                continue
+                
             try:
-                if "{}" in t:
-                    safe_templates.append(t)
-                else:
-                    # if subject already in template, keep; else append subject to make sure it's present
-                    if subj and subj in t:
-                        safe_templates.append(t)
-                    else:
-                        # append a space + subject so subject will appear in the string
-                        safe_templates.append(t + " " + subj if subj else t)
-            except Exception:
-                # on any format-related error, fallback to "{}"
-                safe_templates.append("{}")
+                # 用 subject 替换模板中的 {}
+                formatted_context = template.format(subject)
+                context_list.append(formatted_context)
+                words_list.append(subject)
+                
+                # 调试输出（只显示第一个样本的第一个模板）
+                if req_idx == 0 and template_idx == 0:
+                    print(f"  [DEBUG] First template formatting:")
+                    print(f"    Raw template: {repr(template)}")
+                    print(f"    Subject: {repr(subject)}")
+                    print(f"    Formatted: {repr(formatted_context)}")
+                    
+            except Exception as e:
+                print(f"  [ERROR] Failed to format template {template_idx}:")
+                print(f"    Template: {repr(template)}")
+                print(f"    Subject: {repr(subject)}")
+                print(f"    Error: {e}")
+                # 如果格式化失败，直接使用原始模板（不带subject）
+                context_list.append(template)
+                words_list.append(subject)
 
-        # record
-        for templ in safe_templates:
-            all_contexts.append(templ)
-            all_words.append(subj)
-        counts.append(len(safe_templates))
+    if not context_list:
+        print("  [ERROR] No valid contexts generated!")
+        # 返回零向量
+        hidden_size = model.config.hidden_size
+        return torch.zeros(len(requests), hidden_size, device=model.device)
 
-    if not all_contexts:
-        # nothing to do
-        return torch.zeros((len(requests), hidden_size), device=device, dtype=torch.float32)
+    print(f"  Generated {len(context_list)} context strings")
+    if context_list:
+        print(f"  Sample context: {repr(context_list[0][:50])}...")
 
-    # Call helper to get module input/output at the word positions
+    # 使用统一的函数获取键向量
+    print(f"  [进度] 调用 get_module_input_output_at_words...")
     try:
-        input_vecs, output_vecs = get_module_input_output_at_words(
+        input_vectors, output_vectors = get_module_input_output_at_words(
             model=model,
             tok=tok,
             layer=layer,
-            context_templates=all_contexts,  # can be formatted strings or templates with {}
-            words=all_words,
+            context_templates=context_list,
+            words=words_list,
             module_template=hparams.rewrite_module_tmp,
             fact_token_strategy=hparams.fact_token,
         )
-        # Ensure tensors on model device and float32
-        input_vecs = input_vecs.to(device)
+        
+        print(f"  [进度] 获取到输入向量形状: {input_vectors.shape}")
+        print(f"  [进度] 获取到输出向量形状: {output_vectors.shape}")
+        
+        # 使用输出向量作为键向量（MLP层的输出）
+        layer_ks = output_vectors
+        print(f"  [进度] 使用输出向量作为键向量: {layer_ks.shape}")
+
     except Exception as e:
-        # On failure, return zero keys
-        # Keep function robust: catch and return zeros
-        # (caller should handle zero ks appropriately)
-        # Optionally print minimal error for debugging
-        print(f"[compute_ks] error in get_module_input_output_at_words: {e}")
-        return torch.zeros((len(requests), hidden_size), device=device, dtype=torch.float32)
+        print(f"  [ERROR] Failed in get_module_input_output_at_words: {e}")
+        # 返回零向量
+        hidden_size = model.config.hidden_size
+        return torch.zeros(len(requests), hidden_size, device=model.device)
 
-    # input_vecs shape: [sum_counts, hidden_size]
-    # Now aggregate per original request using counts
-    ks_list = []
-    offset = 0
-    for c in counts:
-        if c <= 0:
-            ks_list.append(torch.zeros(hidden_size, device=device))
-            continue
-        slice_vecs = input_vecs[offset: offset + c]  # shape [c, hidden]
-        # mean across templates for this request
-        ks_mean = slice_vecs.mean(dim=0)
-        ks_list.append(ks_mean)
-        offset += c
+    # 平均处理
+    # 🔥 注意：现在只有一个模板组，所以直接平均
+    final_keys = []
+    
+    for i in range(0, layer_ks.size(0), len(context_templates)):
+        request_idx = i // len(context_templates)
+        if request_idx < len(requests):
+            # 获取该请求的所有模板向量
+            template_vectors = layer_ks[i:i+len(context_templates)]
+            # 平均所有模板
+            request_avg = template_vectors.mean(0)
+            final_keys.append(request_avg)
 
-    # If for any reason offset != input_vecs.size(0), we handle gracefully (pad zeros)
-    if len(ks_list) != len(requests):
-        # fallback: pad or truncate
-        new_list = []
-        for i in range(len(requests)):
-            if i < len(ks_list):
-                new_list.append(ks_list[i])
-            else:
-                new_list.append(torch.zeros(hidden_size, device=device))
-        ks_list = new_list
-
-    ks = torch.stack(ks_list, dim=0)  # [len(requests), hidden_size]
-    return ks
+    if final_keys:
+        result = torch.stack(final_keys, dim=0)
+        print(f"ADIT: 计算完成！得到 {result.shape[0]} 个键向量，维度: {result.shape}")
+    else:
+        print("  [ERROR] No final keys generated!")
+        hidden_size = model.config.hidden_size
+        result = torch.zeros(len(requests), hidden_size, device=model.device)
+    
+    return result

@@ -141,7 +141,7 @@ def get_words_idxs_in_templates(
             idxs.append([token_idx])
             
             # 调试信息
-            '''print(f"\n[DEBUG] get_words_idxs_in_templates - Sample {i}")
+            print(f"\n[DEBUG] get_words_idxs_in_templates - Sample {i}")
             print(f"  Context template: {repr(context)}")
             print(f"  Word: {repr(word)}")
             print(f"  Full text: {repr(full_text)}")
@@ -152,7 +152,7 @@ def get_words_idxs_in_templates(
             if 0 <= token_idx < len(tokens):
                 token_text = tok.decode([tokens[token_idx]])
                 print(f"  Selected token: {repr(token_text)}")
-                print(f"  Token ID: {tokens[token_idx]}")'''
+                print(f"  Token ID: {tokens[token_idx]}")
             
         except Exception as e:
             # 如果offset_mapping失败，使用回退方法
@@ -204,12 +204,12 @@ def get_words_idxs_in_templates(
                 
             idxs.append([idx])
             
-            '''print(f"\n[DEBUG] Fallback method - Sample {i}")
+            print(f"\n[DEBUG] Fallback method - Sample {i}")
             print(f"  Context: '{formatted_context}'")
             print(f"  Word: '{word}' -> tokens: {clean_word_tokens}")
             print(f"  Found at positions: {found_positions}")
             print(f"  Using strategy '{subtoken}' -> index: {idx}")
-            print(f"  Token at index: '{tok.decode([context_tokens[idx]])}'")'''
+            print(f"  Token at index: '{tok.decode([context_tokens[idx]])}'")
     
     return idxs
 

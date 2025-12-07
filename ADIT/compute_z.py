@@ -12,57 +12,85 @@ def compute_z(
     request: Dict,
     hparams: ADITHyperParams,
     layer: int,
-    context_templates: List[str],  # 仍然保留接口，但在 ROME-style 中不再使用
+    context_templates: List[str],
 ) -> torch.Tensor:
     """
-    ROME-style compute_z:
-    --------------------------------------
-    提取目标 object 的内部表征，作为编辑目标向量 z。
-    
-    不依赖模板，不依赖 subject，不依赖 lookup_idx。
-    只依赖 target_new 的 token 序列，获得其在指定层的 MLP 输出表示。
+    ADIT版本：计算目标值向量 - 修复维度问题
     """
 
-    # 1. 获取 target_new 的 string
-    target_str = request.get("target_new", {}).get("str", "")
-    if not target_str:
-        hidden = model.config.hidden_size
-        return torch.zeros(hidden, device=model.device)
+    print("ADIT: Computing target representation")
+    print(f"[DEBUG] Request prompt: {repr(request['prompt'])}")
+    print(f"[DEBUG] Request subject: {repr(request['subject'])}")
 
-    # 2. Tokenize target object
-    enc = tok(target_str, return_tensors="pt", add_special_tokens=False)
-    input_ids = enc["input_ids"].to(model.device)
-    attn_mask = enc.get("attention_mask", None)
-    if attn_mask is not None:
-        attn_mask = attn_mask.to(model.device)
+    # Tokenize target
+    target_ids = tok(request["target_new"]["str"], return_tensors="pt")["input_ids"][0]
+    if target_ids[0] == tok.bos_token_id or target_ids[0] == tok.unk_token_id:
+        target_ids = target_ids[1:]
 
-    # 3. 目标模块名称
-    module_name = hparams.rewrite_module_tmp.format(layer)
+    # 构建编辑提示
+    editing_templates = []
+    input_texts = []
+    
+    for context in context_templates:
+        
+        formatted_template = context.format(request["subject"])
+        full_template = formatted_template + tok.decode(target_ids[:-1])
+        editing_templates.append(full_template)
+        
+        formatted_text = full_template  # 已经格式化，不需要再次格式化
+        input_texts.append(formatted_text)
 
-    # 4. 前向并截取目标层输出
+    # 为ADIT准备输入
+    input_tok = tok(
+        input_texts,
+        return_tensors="pt",
+        padding=True,
+    )
+
+    # 找到关键token位置
+    lookup_idxs = [
+        find_fact_lookup_idx(
+            prompt,
+            request["subject"], 
+            tok, 
+            hparams.fact_token, 
+            verbose=(i == 0)
+        )
+        for i, prompt in enumerate(context_templates)
+    ]
+
+    # 获取目标层的输出表示
     with nethook.TraceDict(
-        model,
-        layers=[module_name],
+        module=model,
+        layers=[hparams.rewrite_module_tmp.format(layer)],
         retain_output=True,
     ) as tr:
-        _ = model(input_ids=input_ids, attention_mask=attn_mask)
-        raw = tr[module_name].output
+        _ = model(**input_tok)
+        raw_output = tr[hparams.rewrite_module_tmp.format(layer)].output
 
-    # 5. 统一输出维度：GPT2 的 Conv1D 可能返回 tuple 或 [seq, hidden]
-    if isinstance(raw, tuple):
-        raw = raw[0]
-    if raw.dim() == 2:
-        raw = raw.unsqueeze(0)
+        if isinstance(raw_output, tuple):
+            layer_output = raw_output[0]
+        else:
+            layer_output = raw_output
 
-    # raw: [1, seq_len, hidden]
-    _, seq_len, hidden = raw.shape
+    print(f"[DEBUG] Layer output shape: {layer_output.shape}")
 
-    # 6. ROME-style：取 target object 最后一个 token 的表示作为 z
-    # （这是 ROME 稳定且标准的做法）
-    z = raw[0, -1, :].detach()
+    # 提取关键位置的表示作为目标z - 输出向量（维度应该是6400）
+    z_list = []
+    for i, idx in enumerate(lookup_idxs):
+        if idx < layer_output[i].shape[0]:
+            z_vector = layer_output[i, idx, :].detach()
+            z_list.append(z_vector)
+            print(f"[DEBUG] Sample {i} z vector shape: {z_vector.shape}")
 
-    return z
+    # 平均所有提示的目标表示
+    if z_list:
+        target_z = torch.stack(z_list).mean(dim=0)
+    else:
+        target_z = layer_output[:, -1, :].mean(dim=0)
 
+    print(f"ADIT: Computed target z vector with norm {target_z.norm()}, shape: {target_z.shape}")
+    return target_z
 
 
 def get_module_input_output_at_words(
@@ -75,14 +103,15 @@ def get_module_input_output_at_words(
     fact_token_strategy: str,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    ADIT版本：获取指定层在关键token位置的输入和输出表示 - 修复GPT-2 Conv1D兼容性
+    ADIT版本：获取指定层在关键token位置的输入和输出表示 - 修复版
     """
+
     print(f"ADIT: Getting module input/output at words for layer {layer}")
 
     # 准备输入文本
     input_texts = []
     for context, word in zip(context_templates, words):
-        input_texts.append(context.format(word) if "{}" in context else context)
+        input_texts.append(context.format(word))
 
     # Tokenize
     input_tok = tok(
@@ -109,59 +138,36 @@ def get_module_input_output_at_words(
         # 获取输入和输出
         layer_module = tr[module_template.format(layer)]
         
-        # 关键修复：处理GPT-2 Conv1D的特殊输入输出格式
+        # 修复：处理可能的维度问题
         input_repr = layer_module.input
         output_repr = layer_module.output
         
-        # 统一处理：如果是元组，取第一个元素
+        # 统一处理输入：可能是元组或单个张量
         if isinstance(input_repr, tuple):
             input_repr = input_repr[0]
+        if input_repr.dim() == 2:
+            input_repr = input_repr.unsqueeze(0)
+            
+        # 统一处理输出：可能是元组或单个张量  
         if isinstance(output_repr, tuple):
             output_repr = output_repr[0]
-        
-        print(f"[DEBUG] Raw input shape: {input_repr.shape}")
-        print(f"[DEBUG] Raw output shape: {output_repr.shape}")
-        
-        # 🔥 关键修复：确保维度正确，处理GPT-2可能的维度转置
-        # 对于GPT-2 Conv1D层，维度应该是 [batch_size, seq_len, hidden_size]
-        if input_repr.dim() == 2:
-            # [seq_len, hidden_size] -> [1, seq_len, hidden_size]
-            input_repr = input_repr.unsqueeze(0)
-        elif input_repr.dim() == 3:
-            # 检查是否是转置的维度 [seq_len, batch, hidden]
-            if input_repr.shape[0] != len(input_texts):
-                # 尝试转置到正确的维度
-                if input_repr.shape[1] == len(input_texts):
-                    print(f"[DEBUG] Fixing input dimension: transposing {input_repr.shape} -> [{len(input_texts)}, {input_repr.shape[0]}, {input_repr.shape[2]}]")
-                    input_repr = input_repr.transpose(0, 1)
-        
         if output_repr.dim() == 2:
             output_repr = output_repr.unsqueeze(0)
-        elif output_repr.dim() == 3:
-            if output_repr.shape[0] != len(input_texts):
-                if output_repr.shape[1] == len(input_texts):
-                    print(f"[DEBUG] Fixing output dimension: transposing {output_repr.shape} -> [{len(input_texts)}, {output_repr.shape[0]}, {output_repr.shape[2]}]")
-                    output_repr = output_repr.transpose(0, 1)
 
-    print(f"[DEBUG] Processed input shape: {input_repr.shape}")
-    print(f"[DEBUG] Processed output shape: {output_repr.shape}")
+    print(f"[DEBUG] Input repr shape: {input_repr.shape}")
+    print(f"[DEBUG] Output repr shape: {output_repr.shape}")
 
     # 提取关键位置的输入和输出表示
     input_vectors = []
     output_vectors = []
     
-    batch_size, seq_len, hidden_size = input_repr.shape
-    
     for i, idx in enumerate(lookup_indices):
-        # 确保索引在范围内
-        if idx >= seq_len:
-            idx = seq_len - 1
-        elif idx < 0:
-            idx = 0
-        
-        # 提取指定位置的向量
-        input_vec = input_repr[i, idx, :].detach()
-        output_vec = output_repr[i, idx, :].detach()
+        if idx < input_repr[i].shape[0]:
+            input_vec = input_repr[i, idx, :].detach()
+            output_vec = output_repr[i, idx, :].detach()
+        else:
+            input_vec = input_repr[i, -1, :].detach()
+            output_vec = output_repr[i, -1, :].detach()
         
         input_vectors.append(input_vec)
         output_vectors.append(output_vec)
@@ -185,12 +191,12 @@ def find_fact_lookup_idx(
     ADIT查找关键Token位置 — 改进版，解决tokenization上下文依赖问题
     """
     
-    '''if verbose:
+    if verbose:
         print("\n[DEBUG] find_fact_lookup_idx")
         print("raw: ",prompt)
         print(f"  prompt: {repr(prompt)}")
         print(f"  subject: {repr(subject)}")
-        print(f"  strategy: {fact_token_strategy}")'''
+        print(f"  strategy: {fact_token_strategy}")
 
     # 直接使用我们改进的repr_tools函数
     if fact_token_strategy == "last":
@@ -233,19 +239,19 @@ def find_fact_lookup_idx(
             )
             tokens = encoding["input_ids"]
             
-            '''if 0 <= result < len(tokens):
+            if 0 <= result < len(tokens):
                 token_at_pos = tok.decode([tokens[result]])
                 print(f"  → 最终位置: {result}, 对应token: '{token_at_pos}'")
             else:
-                print(f"  → 最终位置: {result} (超出范围, tokens长度: {len(tokens)})")'''
+                print(f"  → 最终位置: {result} (超出范围, tokens长度: {len(tokens)})")
                 
         except:
             # 如果offset_mapping失败，使用简单方法
             tokens = tok.encode(full_text, add_special_tokens=False)
-            '''if 0 <= result < len(tokens):
+            if 0 <= result < len(tokens):
                 token_at_pos = tok.decode([tokens[result]])
                 print(f"  → 最终位置: {result}, 对应token: '{token_at_pos}'")
             else:
-                print(f"  → 最终位置: {result} (超出范围)")'''
+                print(f"  → 最终位置: {result} (超出范围)")
     
     return result
