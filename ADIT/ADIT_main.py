@@ -26,6 +26,7 @@ import torch.nn.functional as F
 import numpy as np
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from .ADIT_hparams import ADITHyperParams
+from .compute_z import find_fact_lookup_idx
 
 # ================================
 # Data Structures and Config
@@ -41,6 +42,7 @@ class EditBatchItem:
     subject_position: int = -1
     edit_region_start: int = -1
     edit_region_end: int = -1
+    paraphrase_prompt:List[str]=None
     locality_prompts: List[str] = None
     neighbor_prompts: List[str] = None
     
@@ -571,6 +573,7 @@ class ADITEditor:
                         'subject_vector': torch.zeros(hidden_size),
                         'target_vector': torch.zeros(hidden_size)
                     }
+    
     def compute_hyper_regularization(self, weights_dict):
       """
     计算 hyper network 的正则项：
@@ -663,142 +666,352 @@ class ADITEditor:
       self.opt_lf.step()
       return {"forget_loss": total_loss.item()}
     
-    def step_edit_batch(self, items: List[EditBatchItem], requests: List[Dict]):
-      """编辑步骤：训练 hyper_le，使用多重监督 + 正则"""
-      self.opt_le.zero_grad()
-      total_loss = torch.tensor(0.0, device=self.hparams.device)
+    def step_edit_batch(self, edit_items, edit_requests):
+        """
+        完整且兼容 paraphrase_prompts 为 list 的 step_edit_batch 实现。
+        - 签名与调用处一致：step_edit_batch(edit_items, edit_requests)
+        - 仅支持 paraphrase_prompts 为 list（若不是 list 则跳过 paraphrase 部分）
+        """
 
-      for bi, request in zip(items, requests):
-        ctx = self.build_enhanced_context(bi, request)
-        le_weights = self.hyper_le(ctx)
+        hparams = self.hparams
+        device = hparams.device
 
-        # apply and compute base supervised losses (CE, paraphrase CE, z-vector alignment)
-        self._apply_lora_weights(le_weights)
-        loss_supervised = self.compute_direct_supervision_loss(bi, request, le_weights)
+        # reset optimizer gradients
+        try:
+            self.opt_le.zero_grad()
+        except Exception:
+            pass
 
-        # paraphrase KL + multi-prompt consistency
-        kl_para = torch.tensor(0.0, device=self.hparams.device)
-        paraphrase_prompt = request.get("paraphrase_prompt", None)
-        if paraphrase_prompt:
-            ids_ref, attn_ref = self.tok_helper.encode(bi.prompt_formatted, self.hparams.device)
-            ids_para, attn_para = self.tok_helper.encode(paraphrase_prompt, self.hparams.device)
+        total_loss = torch.tensor(0.0, device=device)
 
-            # compute reference P with base model (no lora)
-            with torch.no_grad():
-                self._clear_all_lora()
-                out_ref = self.base_model(input_ids=ids_ref, attention_mask=attn_ref)
-                P = F.softmax(out_ref.logits, dim=-1)
+        # logging accumulators
+        log_ce = 0.0
+        log_para_ce = 0.0
+        log_para_kl = 0.0
+        log_neighbor_kl = 0.0
+        log_vec = 0.0
 
-            # apply le lora and compute Q on paraphrase prompt
-            self._apply_lora_weights(le_weights, clear_first=False)
-            out_para = self.base_model(input_ids=ids_para, attention_mask=attn_para)
-            Q_log = F.log_softmax(out_para.logits, dim=-1)
-            kl_para = F.kl_div(Q_log, P, reduction="batchmean")
+        # iterate paired items & requests
+        for bi, request in zip(edit_items, edit_requests):
 
-        # neighbor prompts consistency (if provided)
-        kl_neighbor = torch.tensor(0.0, device=self.hparams.device)
-        for neigh in bi.neighbor_prompts[:2]:
-            ids_ne, attn_ne = self.tok_helper.encode(neigh, self.hparams.device)
-            with torch.no_grad():
-                self._clear_all_lora()
-                out_orig = self.base_model(input_ids=ids_ne, attention_mask=attn_ne)
-                Pn = F.softmax(out_orig.logits, dim=-1)
-            self._apply_lora_weights(le_weights, clear_first=False)
-            out_ne = self.base_model(input_ids=ids_ne, attention_mask=attn_ne)
-            Qn_log = F.log_softmax(out_ne.logits, dim=-1)
-            kl_neighbor = kl_neighbor + F.kl_div(Qn_log, Pn, reduction="batchmean")
+            # ------------------------------------------------------
+            # 0) build context & generate LoRA via hyper_le
+            # ------------------------------------------------------
+            ctx = self.build_guided_context(bi, request)
+            le_weights = self.hyper_le(ctx)
 
-        # hyper regularization
-        reg = self.compute_hyper_regularization(le_weights)
+            # ------------------------------------------------------
+            # 1) apply LoRA (rewrite/paraphrase CE uses edited model)
+            # ------------------------------------------------------
+            self._apply_lora_weights(le_weights, clear_first=True)
 
-        # assemble loss with tuned weights
-        loss = (
-            loss_supervised +
-            0.3 * kl_para +
-            0.2 * kl_neighbor +
-            reg["total"]
-        )
-        total_loss = total_loss + loss
+            # ------------------------------------------------------
+            # 2) Rewrite CE (main editing loss)
+            # ------------------------------------------------------
+            tgt_new = request["target_new"]["str"]
+            ids, attn, labels = self.tok_helper.encode_label_for_target(
+                bi.prompt_formatted, tgt_new, device
+            )
+            ce_loss = lm_ce_loss(self.base_model, ids, attn, labels)
+            log_ce += float(ce_loss.detach().cpu())
 
-        self._clear_all_lora()
+            # ------------------------------------------------------
+            # 3) Paraphrase CE & KL (paraphrase_prompts as list)
+            # ------------------------------------------------------
+            para_ce_total = torch.tensor(0.0, device=device)
+            para_kl_total = torch.tensor(0.0, device=device)
 
-      total_loss = total_loss / max(1, len(items))
-      total_loss.backward()
-      torch.nn.utils.clip_grad_norm_(self.hyper_le.parameters(), 1.0)
-      self.opt_le.step()
-      return {"edit_loss": total_loss.item()}
+            paraphrase_prompts = request.get("paraphrase_prompts", None)
+            
+            if paraphrase_prompts and isinstance(paraphrase_prompts, list):
+                for pp in paraphrase_prompts:
+
+                    # 3a) paraphrase CE
+                    para_ids, para_attn, para_labels = self.tok_helper.encode_label_for_target(
+                        pp, tgt_new, device
+                    )
+                    para_ce = lm_ce_loss(self.base_model, para_ids, para_attn, para_labels)
+                    para_ce_total = para_ce_total + para_ce
+                    log_para_ce += float(para_ce.detach().cpu())
+
+                    # 3b) paraphrase KL:
+                    #     P = original model w/o LoRA
+                    with torch.no_grad():
+                        self._clear_all_lora()
+                        ref_logits = self.base_model(
+                            input_ids=para_ids,
+                            attention_mask=para_attn
+                        ).logits
+                        P_para = F.softmax(ref_logits, dim=-1)
+
+                    #     Q = edited model
+                    self._apply_lora_weights(le_weights, clear_first=True)
+                    edited_logits = self.base_model(
+                        input_ids=para_ids,
+                        attention_mask=para_attn
+                    ).logits
+                    Q_log = F.log_softmax(edited_logits, dim=-1)
+
+                    para_kl = F.kl_div(Q_log, P_para, reduction="batchmean")
+                    para_kl_total = para_kl_total + para_kl
+                    log_para_kl += float(para_kl.detach().cpu())
+
+            # ------------------------------------------------------
+            # 4) Neighbor Stability KL
+            # ------------------------------------------------------
+            neighbor_kl = torch.tensor(0.0, device=device)
+            neighbor_prompts = request.get("neighbor_prompts", []) or []
+
+            if len(neighbor_prompts) > 0:
+                max_neighbors = min(
+                    len(neighbor_prompts),
+                    getattr(hparams, "max_neighbors_eval", 5)
+                )
+
+                for nprompt in neighbor_prompts[:max_neighbors]:
+
+                    n_ids, n_attn = self.tok_helper.encode(nprompt, device)
+
+                    # P = original model
+                    with torch.no_grad():
+                        self._clear_all_lora()
+                        ref_logits = self.base_model(
+                            input_ids=n_ids,
+                            attention_mask=n_attn
+                        ).logits
+                        P_n = F.softmax(ref_logits, dim=-1)
+
+                    # Q = edited model
+                    self._apply_lora_weights(le_weights, clear_first=True)
+                    edited_logits = self.base_model(
+                        input_ids=n_ids,
+                        attention_mask=n_attn
+                    ).logits
+                    Q_log_n = F.log_softmax(edited_logits, dim=-1)
+
+                    kl_n = F.kl_div(Q_log_n, P_n, reduction="batchmean")
+                    neighbor_kl = neighbor_kl + kl_n
+
+                neighbor_kl = neighbor_kl / max_neighbors
+                log_neighbor_kl += float(neighbor_kl.detach().cpu())
+
+            lambda_neighbor = getattr(
+                hparams,
+                "lambda_neighbor",
+                hparams.lambda_loc if hasattr(hparams, "lambda_loc") else 1.0
+            )
+
+            # ------------------------------------------------------
+            # 5) vector guidance
+            # ------------------------------------------------------
+            vector_loss = torch.tensor(0.0, device=device)
+            if getattr(hparams, "use_vector_guidance", False):
+                vector_loss = self.compute_direct_supervision_loss(bi, request, le_weights)
+                log_vec += float(vector_loss.detach().cpu())
+
+            # ------------------------------------------------------
+            # 6) total loss
+            # ------------------------------------------------------
+            loss_i = (
+                ce_loss
+                + 0.6 * para_ce_total
+                + 0.2 * para_kl_total
+                + lambda_neighbor * neighbor_kl
+                + hparams.vector_alignment_weight * vector_loss
+            )
+
+            total_loss = total_loss + loss_i
+
+        # ------------------------------------------------------
+        # backward + optimizer
+        # ------------------------------------------------------
+        total_loss = total_loss / max(1, len(edit_items))
+        total_loss.backward()
+
+        try:
+            torch.nn.utils.clip_grad_norm_(self.hyper_le.parameters(), 1.0)
+        except Exception:
+            pass
+
+        try:
+            self.opt_le.step()
+        except Exception:
+            pass
+
+        # logging output
+        return {
+            "edit_loss": total_loss.item(),
+            "edit/ce_new": log_ce / max(1, len(edit_items)),
+            "edit/paraphrase_ce": log_para_ce / max(1, len(edit_items)),
+            "edit/paraphrase_kl": log_para_kl / max(1, len(edit_items)),
+            "edit/neighbor_kl": log_neighbor_kl / max(1, len(edit_items)),
+            "edit/vector_loss": log_vec / max(1, len(edit_items)),
+        }
+
+
+
     
-    def build_enhanced_context(self, batch: EditBatchItem, request: Dict):
-        """构建增强的上下文，包含向量指导"""
-        # 基础上下文：prompt的embedding均值
-        base_ctx = self.context_extractor.extract_context(
-            batch.prompt_formatted, batch.target_new, self.hparams.device
-        )
-        
+    def compute_vector_alignment_loss(self, batch: EditBatchItem, request: Dict, lookup_idx: int):
+        """计算向量对齐损失 - 简化版本"""
         if not self.hparams.use_vector_guidance:
-            return base_ctx
+            return torch.tensor(0.0, device=self.hparams.device)
         
-        # 添加向量指导
         subject = batch.subject
-        layer = self.hparams.layers[0]  # 使用第一个层
+        if not subject:
+            return torch.tensor(0.0, device=self.hparams.device)
+        
+        # 只使用第一个层
+        layer = self.hparams.layers[0]
         cache_key = f"{subject}_layer{layer}"
         
         if cache_key in self.vector_cache:
-            # 获取预计算的向量
-            ks_vector = self.vector_cache[cache_key]['subject_vector'].to(self.hparams.device)
-            z_vector = self.vector_cache[cache_key]['target_vector'].to(self.hparams.device)
-            
-            # 将向量信息融入上下文
-            alpha = self.hparams.vector_guidance_weight
-            guided_ctx = base_ctx + alpha * (z_vector - ks_vector).unsqueeze(0)
-            return guided_ctx
+            try:
+                # 获取目标向量
+                target_vector = self.vector_cache[cache_key]['target_vector'].to(self.hparams.device)
+                
+                # 准备输入
+                enc = self.tokenizer(batch.prompt_formatted + batch.target_new, 
+                                    return_tensors="pt", truncation=True).to(self.hparams.device)
+                
+                # 获取最后一层的输出
+                layer_name = self.hparams.rewrite_module_tmp.format(layer)
+                with nethook.Trace(self.base_model, layername=layer_name) as tr:
+                    _ = self.base_model(input_ids=enc["input_ids"], 
+                                      attention_mask=enc.get("attention_mask", None))
+                
+                # 获取最后一个token的隐藏状态
+                hidden = tr.output[:, -1, :]
+                
+                # 计算对齐损失
+                loss = F.mse_loss(hidden, target_vector.unsqueeze(0))
+                return loss
+                
+            except Exception as e:
+                print(f"[WARN] vector alignment failed: {e}")
         
+        return torch.tensor(0.0, device=self.hparams.device)
+    
+    def _get_base_context(self, batch: EditBatchItem) -> torch.Tensor:
+        """获取基础上下文（原始方法）"""
+        try:
+            with torch.no_grad():
+                ids, _ = self.tok_helper.encode(batch.prompt_formatted + batch.target_new, self.hparams.device)
+                if hasattr(self.base_model, "transformer") and hasattr(self.base_model.transformer, "wte"):
+                    emb = self.base_model.transformer.wte(ids)
+                elif hasattr(self.base_model, "model") and hasattr(self.base_model.model, "embed_tokens"):
+                    emb = self.base_model.model.embed_tokens(ids)
+                else:
+                    emb = torch.randn(1, ids.size(1), self.hparams.ctx_dim, device=self.hparams.device)
+                return emb.mean(dim=1)
+        except:
+            # 回退
+            return torch.randn(1, self.hparams.ctx_dim, device=self.hparams.device)
+
+    
+    def build_guided_context(self, batch: EditBatchItem, request: Dict) -> torch.Tensor:
+      """
+    修复 Train-Test Context Mismatch 的版本：
+    - 训练与推理均使用同一类型的 context：仅基于 prompt_formatted
+    - 不再将 target_new 注入 HyperNetwork 输入（防止泄漏导致 rewrite 失败）
+    - 用 subject_vector（ks_vector）增强可控性
+    """
+
+      try:
+        device = self.hparams.device
+
+        # ================================================================
+        # 1) 基础上下文：只使用 prompt_formatted（无 target_new）
+        # ---------------------------------------------------------------
+        # 不再使用 prompt + target_new 的 embedding.mean —— 这是导致 rewrite 全/崩的核心问题
+        # ================================================================
+
+        ids, _ = self.tok_helper.encode(batch.prompt_formatted, device)
+
+        # 用 embedding 得到 prompt 表达
+        if hasattr(self.base_model, "transformer") and hasattr(self.base_model.transformer, "wte"):
+            emb = self.base_model.transformer.wte(ids)
+        elif hasattr(self.base_model, "model") and hasattr(self.base_model.model, "embed_tokens"):
+            emb = self.base_model.model.embed_tokens(ids)
+        else:
+            # fallback
+            emb = torch.randn(1, ids.size(1), self.hparams.ctx_dim, device=device)
+
+        base_ctx = emb.mean(dim=1)  # [1, hidden]
+
+        # ================================================================
+        # 2) subject_vector guidance（如果有）
+        # ---------------------------------------------------------------
+        # 使用你预计算的 ks_vector 强化 subject-specific rewrite
+        # ================================================================
+        if self.hparams.use_vector_guidance and batch.subject:
+            layer = self.hparams.layers[0]
+            key = f"{batch.subject}_layer{layer}"
+
+            if key in self.vector_cache:
+                ks_vector = self.vector_cache[key]["subject_vector"].to(device)
+
+                if ks_vector.dim() == 1:
+                    ks_vector = ks_vector.unsqueeze(0)
+
+                guided_ctx = base_ctx + self.hparams.vector_guidance_weight * ks_vector
+                return guided_ctx
+
+        # 无 subject 或无向量 —— 仅用 prompt context
         return base_ctx
+
+      except Exception as e:
+        print(f"[ERROR] build_guided_context failed (patched version): {e}")
+        return torch.randn(1, self.hparams.ctx_dim, device=self.hparams.device)
+
+
     
     def compute_direct_supervision_loss(self, batch: EditBatchItem, request: Dict, le_weights):
-      """
-    综合直接监督：
-      - CE(prompt -> target_new)
-      - paraphrase CE (如果提供 paraphrase_prompt)
-      - representation alignment using compute_z (如果 enabled)
-    """
-      total_loss = torch.tensor(0.0, device=self.hparams.device)
+        """
+        综合直接监督：
+          - CE(prompt -> target_new)
+          - paraphrase CE (如果提供 paraphrase_prompt)
+          - representation alignment using compute_z (如果 enabled)
+        """
+        total_loss = torch.tensor(0.0, device=self.hparams.device)
 
-    # (1) main CE
-      ids, attn, labels = self.tok_helper.encode_label_for_target(
-        batch.prompt_formatted, batch.target_new, self.hparams.device
-    )
-      ce_loss = lm_ce_loss(self.base_model, ids, attn, labels)
-      total_loss = total_loss + ce_loss * 1.0
-
-    # (2) paraphrase CE if provided
-      paraphrase_prompt = request.get("paraphrase_prompt", None)
-      if paraphrase_prompt:
-        para_ids, para_attn, para_labels = self.tok_helper.encode_label_for_target(
-            paraphrase_prompt, batch.target_new, self.hparams.device
+        # (1) main CE
+        ids, attn, labels = self.tok_helper.encode_label_for_target(
+            batch.prompt_formatted, batch.target_new, self.hparams.device
         )
-        para_ce = lm_ce_loss(self.base_model, para_ids, para_attn, para_labels)
-        total_loss = total_loss + 0.8 * para_ce
+        ce_loss = lm_ce_loss(self.base_model, ids, attn, labels)
+        total_loss = total_loss + ce_loss * 1.0
 
-    # (3) z-vector guidance (representation alignment)
-      if self.hparams.use_vector_guidance:
-        layer = self.hparams.layers[0]
-        key = f"{batch.subject}_layer{layer}"
-        if key in self.vector_cache:
-            target_vec = self.vector_cache[key]['target_vector'].to(self.hparams.device)
-            # try to fetch last token hidden from that layer
-            try:
-                enc = self.tokenizer(batch.prompt_formatted + batch.target_new, return_tensors="pt", truncation=True).to(self.hparams.device)
-                with nethook.Trace(self.base_model, layername=self.hparams.rewrite_module_tmp.format(layer)) as tr:
-                    _ = self.base_model(input_ids=enc["input_ids"], attention_mask=enc.get("attention_mask", None))
-                hidden = tr.output[:, -1, :]
-                rep_loss = F.mse_loss(hidden, target_vec.unsqueeze(0))
-                total_loss = total_loss + 0.5 * rep_loss
-            except Exception as e:
-                # best-effort, don't crash training
-                print("[WARN] vector alignment failed:", e)
+        # (2) paraphrase CE if provided
+        paraphrase_prompt = request.get("paraphrase_prompt", None)
+        if paraphrase_prompt:
+            para_ids, para_attn, para_labels = self.tok_helper.encode_label_for_target(
+                paraphrase_prompt, batch.target_new, self.hparams.device
+            )
+            para_ce = lm_ce_loss(self.base_model, para_ids, para_attn, para_labels)
+            total_loss = total_loss + 0.8 * para_ce
 
-      return total_loss
+        # (3) z-vector guidance (representation alignment)
+        if self.hparams.use_vector_guidance:
+            layer = self.hparams.layers[0]
+            key = f"{batch.subject}_layer{layer}"
+            if key in self.vector_cache:
+                target_vec = self.vector_cache[key]['target_vector'].to(self.hparams.device)
+                # try to fetch last token hidden from that layer
+                try:
+                    enc = self.tokenizer(batch.prompt_formatted + batch.target_new, 
+                                        return_tensors="pt", truncation=True).to(self.hparams.device)
+                    with nethook.Trace(self.base_model, 
+                                      layername=self.hparams.rewrite_module_tmp.format(layer)) as tr:
+                        _ = self.base_model(input_ids=enc["input_ids"], 
+                                          attention_mask=enc.get("attention_mask", None))
+                    hidden = tr.output[:, -1, :]
+                    rep_loss = F.mse_loss(hidden, target_vec.unsqueeze(0))
+                    total_loss = total_loss + 0.5 * rep_loss
+                except Exception as e:
+                    # best-effort, don't crash training
+                    print("[WARN] vector alignment failed:", e)
+
+        return total_loss
 
     
     
@@ -823,7 +1036,7 @@ class ADITEditor:
 
             for fi, f_batch in enumerate(f_iter):
                 f_items, f_requests = zip(*f_batch)
-                log_f = self.step_forget_batch(f_items)
+                #log_f = self.step_forget_batch(f_items)
                 
                 for _ in range(edit_per_forget):
                     if e_idx >= len(e_iter):
@@ -841,12 +1054,13 @@ class ADITEditor:
                     log_e = self.step_edit_batch(e_items, e_requests)
                     e_idx += 1
 
-                print(f"[ep {ep+1}] [forget {fi+1}/{len(f_iter)}] loss: {log_f['forget_loss']:.4f}  "
-                      f"|  edit loss: {log_e['edit_loss']:.4f}")
+                print(log_e)
     
     def get_model_for_evaluation(self):
-      """获取用于评估的模型包装器 - 完整支持版本"""
-    
+      """返回用于评估的动态模型，保证评估时使用 build_guided_context 生成 LoRA"""
+
+      editor = self
+
       class DynamicEvaluationModel:
         def __init__(self, base_model, hyper_le, context_extractor, hparams, tokenizer, editor):
             self.base_model = base_model
@@ -855,89 +1069,81 @@ class ADITEditor:
             self.hparams = hparams
             self.tokenizer = tokenizer
             self.editor = editor
-            
-            # 复制重要属性
+
             self.config = base_model.config
             self.device = hparams.device
             self.dtype = base_model.dtype
-            
-            # ADIT动态模型标记
-            self.is_adit_model = True
-            
-            # 当前上下文
+
+            # 保存当前 request (必需)
+            self.current_request = None
+            # 保存当前 prefix（由 wrapper 设置）
             self.current_prefix = None
-            self.current_target = ""
-            self.current_lora_weights = None
-            
-            # 缓存已生成的LoRA权重
+            # 保存当前 subject
+            self.current_subject = None
+
+            # 缓存已生成的 LoRA 权重
             self.lora_cache = {}
-        
-        def set_current_prefix(self, prefix: str):
-            """设置当前prefix并生成对应的LoRA权重"""
+
+        # -------------------------------------------------------
+        # 必需的新接口：设置 prefix + subject + request
+        # -------------------------------------------------------
+        def set_edit_context(self, prefix: str, subject: str, request: dict):
             self.current_prefix = prefix
-            
-            # 生成缓存键
-            cache_key = f"{prefix}_{self.current_target}"
-            
-            if cache_key not in self.lora_cache:
-                # 提取上下文
-                ctx = self.context_extractor.extract_context(
-                    prefix, self.current_target, self.device
-                )
+            self.current_subject = subject
+            self.current_request = request
+
+            # ------------------------------------------------------
+            # FIX: 按训练时的 EditBatchItem 完整字段构造 batch
+            # ------------------------------------------------------
+            batch = EditBatchItem(
+                prompt_template=prefix,
+                prompt_formatted=prefix,
+                subject=subject,
+                target_true=request["target_true"]["str"] if "target_true" in request else "",
+                target_new=request["target_new"]["str"] if "target_new" in request else "",
                 
-                # 生成LoRA权重
+            )
+            # ------------------------------------------------------
+
+            # cache key
+            cache_key = f"{prefix}::{subject}"
+
+            if cache_key not in self.lora_cache:
+                ctx = self.editor.build_guided_context(batch, request)
                 with torch.no_grad():
                     le_weights = self.hyper_le(ctx)
-                
-                # 缓存
                 self.lora_cache[cache_key] = le_weights
-            
-            # 获取LoRA权重
-            self.current_lora_weights = self.lora_cache[cache_key]
-            
-            # 应用到动态层
-            self._apply_current_lora_weights()
-        
-        def clear_current_prefix(self):
-            """清除当前prefix"""
-            self.current_prefix = None
-            self.current_lora_weights = None
-            self._clear_lora_weights()
-        
-        def _apply_current_lora_weights(self):
-            """应用当前LoRA权重"""
-            if self.current_lora_weights is None:
-                return
-            
-            for layer_name, (A, B) in self.current_lora_weights.items():
+
+            self._apply_lora(self.lora_cache[cache_key])
+
+
+        # -------------------------------------------------------
+        def _apply_lora(self, weights):
+            for layer_name, vals in weights.items():
+                A, B = vals[0], vals[1]
+                gate = vals[2] if len(vals) > 2 else None
+
                 if layer_name in self.editor.dynamic_layers:
                     self.editor.dynamic_layers[layer_name].bind_runtime_weights(
-                        A, B, alpha=getattr(self.hparams, "alpha", None)
+                        A, B, alpha=self.hparams.alpha, gate=gate
                     )
-        
-        def _clear_lora_weights(self):
-            """清除所有LoRA权重"""
+
+        def _clear_lora(self):
             for layer in self.editor.dynamic_layers.values():
                 layer.clear_runtime_weights()
-        
-        def __call__(self, input_ids, attention_mask=None, **kwargs):
-            """前向传播"""
-            # 注意：这个函数现在只会在设置好当前prefix后被调用
-            # 当前LoRA权重已经应用
-            
+
+        # -------------------------------------------------------
+        # Forward：只负责推理（LoRA 已在外部绑定好）
+        # -------------------------------------------------------
+        def __call__(self, input_ids=None, attention_mask=None, **kwargs):
             with torch.no_grad():
-                outputs = self.base_model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    **kwargs
-                )
-            
-            return outputs
-    
+                return self.base_model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+
       return DynamicEvaluationModel(
-        self.base_model, self.hyper_le, self.context_extractor, 
+        self.base_model, self.hyper_le, self.context_extractor,
         self.hparams, self.tokenizer, self
     )
+
 
 # ================================
 # Main Interface Function (保持不变)
@@ -949,7 +1155,7 @@ def apply_ADIT_to_model(
     requests: List[Dict],
     hparams: Any,
     **kwargs
-) -> Tuple[AutoModelForCausalLM, ADITEditor]:
+):
     """
     ADIT主接口函数 - 完全兼容现有接口
     """
@@ -1019,6 +1225,7 @@ def apply_ADIT_to_model(
             
             batch_items.append(EditBatchItem(
                 prompt_template=request['prompt'],
+                paraphrase_prompt=request.get('paraphrase_prompts',None),
                 prompt_formatted=prompt_formatted,
                 subject=subject,
                 target_true=_norm_target(target_true),
@@ -1071,6 +1278,7 @@ def apply_ADIT_to_model(
         
         batch_items.append(EditBatchItem(
             prompt_template=request['prompt'],
+            paraphrase_prompt=request.get('paraphrase_prompts',None),
             prompt_formatted=prompt_formatted,
             subject=subject,
             target_true=_norm_target(target_true),

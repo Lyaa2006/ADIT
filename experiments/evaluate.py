@@ -70,46 +70,53 @@ def create_batch_item_from_request(request: Dict) -> Dict:
         'neighbor_prompts': request.get('neighbor_prompts', []) or [],
     }
 
-def evaluate_with_editor(editor: ADITEditor, record: Dict, ds_eval_method, 
+def evaluate_with_editor(editor: ADITEditor, record: Dict, ds_eval_method,
                         gen_test_vars: List, generation_test_interval: int) -> Dict:
-    """使用ADIT编辑器进行评估 - 直接使用增强模型"""
-    
-    # 关键：使用editor.get_model_for_evaluation()返回的增强模型
+
     enhanced_model = editor.get_model_for_evaluation()
-    
-    # 这个enhanced_model的forward已经内置了动态LoRA生成
-    # 直接用它进行评估
-    
-    # 但是有一个问题：这个增强模型需要知道"当前要编辑哪个subject"
-    # 我们需要传递这个信息给模型
-    
-    # 解决方案1：在模型调用前设置当前subject
+
+    tokenizer = editor.tokenizer
     subject = record["requested_rewrite"]["subject"]
-    
-    # 创建一个包装器，在forward前设置当前subject
-    class SubjectAwareModelWrapper:
-        def __init__(self, enhanced_model, subject, editor):
+    request = record["requested_rewrite"]
+
+    # prefix-aware wrapper
+    class PrefixAwareWrapper:
+        def __init__(self, enhanced_model, subject, request, tokenizer):
             self.enhanced_model = enhanced_model
             self.subject = subject
-            self.editor = editor
-            # 复制属性
+            self.request = request
+            self.tokenizer = tokenizer
             self.config = enhanced_model.config
-            
-        def __call__(self, **kwargs):
-            # 在forward前，设置当前要编辑的subject
-            # 这样enhanced_model就知道为谁生成LoRA
-            self.enhanced_model.current_subject = self.subject
-            
-            # 调用增强模型（它会动态生成LoRA）
-            return self.enhanced_model(**kwargs)
-    
-    # 创建包装器
-    model_wrapper = SubjectAwareModelWrapper(enhanced_model, subject, editor)
-    
-    # 进行评估
+
+        def __call__(self, input_ids=None, attention_mask=None, **kwargs):
+
+            # 1. 从 input_ids 解码 prefix
+            if input_ids is not None:
+                prefix = self.tokenizer.decode(
+                    input_ids[0], skip_special_tokens=True
+                )
+            else:
+                prefix = ""
+
+            # 2. 设置本次编辑上下文（prefix + subject + request）
+            self.enhanced_model.set_edit_context(
+                prefix=prefix,
+                subject=self.subject,
+                request=self.request
+            )
+
+            # 3. 推理（LoRA 已应用）
+            return self.enhanced_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                **kwargs
+            )
+
+    wrapped_model = PrefixAwareWrapper(enhanced_model, subject, request, tokenizer)
+
     post_results = ds_eval_method(
-        model_wrapper,  # ← 使用包装器
-        editor.tokenizer,
+        wrapped_model,
+        tokenizer,
         record,
         *(
             gen_test_vars
@@ -117,8 +124,9 @@ def evaluate_with_editor(editor: ADITEditor, record: Dict, ds_eval_method,
             else [None, None]
         ),
     )
-    
+
     return post_results
+
 def main(
     alg_name: str,
     model_name: Union[str, Tuple],
